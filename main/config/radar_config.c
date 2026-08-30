@@ -21,6 +21,9 @@ void radar_config_defaults(radar_config_t *config)
     config->radius_deg = 0.75;
     config->show_sweep = true;
     config->show_labels = true;
+    config->show_airports = true;
+    config->show_coastlines = false;
+    config->show_grounded = false;
 }
 
 esp_err_t radar_config_load(radar_config_t *config)
@@ -46,6 +49,9 @@ esp_err_t radar_config_load(radar_config_t *config)
     uint8_t flag;
     if (nvs_get_u8(nvs, "sweep", &flag) == ESP_OK) config->show_sweep = flag != 0;
     if (nvs_get_u8(nvs, "labels", &flag) == ESP_OK) config->show_labels = flag != 0;
+    if (nvs_get_u8(nvs, "airports", &flag) == ESP_OK) config->show_airports = flag != 0;
+    if (nvs_get_u8(nvs, "coastlines", &flag) == ESP_OK) config->show_coastlines = flag != 0;
+    if (nvs_get_u8(nvs, "grounded", &flag) == ESP_OK) config->show_grounded = flag != 0;
     nvs_close(nvs);
 
     if (config->radius_deg < 0.05 || config->radius_deg > 2.5) {
@@ -70,6 +76,9 @@ esp_err_t radar_config_save(const radar_config_t *config)
     SAVE(nvs_set_str(nvs, "client_secret", config->opensky_client_secret));
     SAVE(nvs_set_u8(nvs, "sweep", config->show_sweep));
     SAVE(nvs_set_u8(nvs, "labels", config->show_labels));
+    SAVE(nvs_set_u8(nvs, "airports", config->show_airports));
+    SAVE(nvs_set_u8(nvs, "coastlines", config->show_coastlines));
+    SAVE(nvs_set_u8(nvs, "grounded", config->show_grounded));
     err = nvs_commit(nvs);
 done:
     nvs_close(nvs);

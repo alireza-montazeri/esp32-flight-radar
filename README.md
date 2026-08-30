@@ -14,6 +14,7 @@ would also require an SDR or dedicated ADS-B RF front end and antenna.
 
 - Live OpenSky aircraft positions inside a configurable bounding box
 - Nearby scheduled-service airport markers from a bundled offline database
+- Simplified global coastlines from a bundled offline vector map
 - Aircraft heading, callsign or ICAO address, and altitude
 - Position prediction between API updates
 - First-boot Wi-Fi, location, display, and OpenSky setup page
@@ -185,6 +186,9 @@ that Wi-Fi connection rather than Ethernet, cellular data, or a VPN.
 | Radius              | 0.05 to 2.5 degrees                                                 |
 | Animated sweep      | Enables the rotating, fading green radar beam                       |
 | Aircraft labels     | Shows the callsign or ICAO24 address                                |
+| Airports            | Shows bundled airport plus markers and codes                        |
+| Coastlines          | Shows the bundled Natural Earth coastline layer                     |
+| Grounded aircraft   | Includes aircraft currently reported on the ground                  |
 | OAuth client ID     | Optional OpenSky API client ID                                      |
 | OAuth client secret | Optional OpenSky API client secret; blank retains the stored secret |
 
@@ -245,9 +249,10 @@ anonymous access.
 
 After Wi-Fi connection, the radar fetches nearby aircraft and shows:
 
+- Dim blue coastline vectors clipped to the circular radar range
 - White plus airport markers with white IATA/ICAO labels inside the radar circle
 - Green aircraft symbols for airborne aircraft
-- Aircraft reported by OpenSky as on the ground are excluded
+- Optional amber symbols for aircraft reported by OpenSky as on the ground
 - GPS-style aircraft symbols rotated to the nearest of 16 heading directions
 - Callsign, or ICAO24 address when no callsign is available
 - OpenSky-native units: altitude in metres and speed/vertical rate in metres per second
@@ -269,6 +274,11 @@ Aircraft and route metadata may be incomplete or incorrect. Routes are inferred
 from callsigns and are commonly unavailable for private, charter, military, or
 callsign-changing flights. A failed enrichment lookup does not interrupt live
 OpenSky tracking.
+
+Airports are enabled by default. Coastlines and grounded aircraft are disabled
+by default. The grounded-aircraft option reflects OpenSky's current
+`on_ground` state; it does not display historical flights that have already
+disappeared from the live response.
 
 HTTPS requests are serialized to limit ESP32 memory pressure. OpenSky requests
 have a 20-second total deadline and failed updates retry after 10 seconds.
@@ -310,6 +320,26 @@ The generated `main/data/airport_data.c` is committed with the project, so this
 command is not required for a normal or offline firmware build. You can also
 regenerate from a downloaded CSV with
 `python tools/generate_airport_data.py --source path/to/airports.csv`.
+
+### Coastline data
+
+Coastlines are bundled vector data and do not add a runtime API request. They
+are generated from
+[Natural Earth's public-domain 1:50m coastline dataset](https://www.naturalearthdata.com/downloads/50m-physical-vectors/),
+stored as quantized degree coordinates, and clipped to the circular radar
+range on the device. Projected segments are cached in PSRAM and recalculated
+only when the radar centre or radius changes.
+
+To refresh the bundled coastline data, run:
+
+```powershell
+python tools/generate_coastline_data.py
+```
+
+The generated `main/data/coastline_data.c` is committed, so an ordinary build
+does not require Python or internet access. A downloaded Natural Earth GeoJSON
+file can be supplied with
+`python tools/generate_coastline_data.py --source path/to/coastline.geojson`.
 
 Controls:
 
@@ -459,7 +489,7 @@ components from the manifest and lock file during the next build.
 - `main/app` - startup orchestration, knob control, and radar polling
 - `main/board` - verified pins and Waveshare SH8601/LVGL display port
 - `main/config` - persistent NVS configuration
-- `main/data` - generated offline scheduled-airport coordinates
+- `main/data` - generated offline airport and coastline coordinates
 - `main/hardware` - DRV2605 haptic control
 - `main/model` - shared aircraft data structures
 - `main/network` - Wi-Fi, web setup, HTTPS, OAuth, and OpenSky parsing
@@ -477,4 +507,5 @@ components from the manifest and lock file during the next build.
 - At most 64 aircraft are rendered.
 - Aircraft without a reported latitude or longitude are ignored.
 - OpenSky coverage and update timing determine what appears on screen.
+- Coastlines are simplified visual context and must not be used for navigation.
 - This project does not directly receive ADS-B radio transmissions.

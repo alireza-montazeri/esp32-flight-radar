@@ -13,6 +13,9 @@ typedef struct {
     char opensky_client_secret[128];
     bool show_sweep;
     bool show_labels;
+    bool show_airports;
+    bool show_coastlines;
+    bool show_grounded;
 } radar_config_t;
 
 void radar_config_defaults(radar_config_t *config);

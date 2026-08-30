@@ -12,6 +12,7 @@
 #include "freertos/task.h"
 #include "lvgl.h"
 #include "airport_data.h"
+#include "coastline_data.h"
 #include "user_config.h"
 #include "waveshare_display_port.h"
 
@@ -46,6 +47,8 @@ typedef struct
     double radius_deg;
     bool show_sweep;
     bool show_labels;
+    bool show_airports;
+    bool show_coastlines;
     bool wifi_connected;
     bool detail_active;
     char selected_icao24[7];
@@ -136,6 +139,56 @@ static bool airport_screen_position(const radar_airport_t *airport,
 
     *x = RADAR_CENTER + (int)lround(x_norm * RADAR_RADIUS_PX);
     *y = RADAR_CENTER - (int)lround(y_norm * RADAR_RADIUS_PX);
+    return true;
+}
+
+typedef struct
+{
+    int16_t x1;
+    int16_t y1;
+    int16_t x2;
+    int16_t y2;
+} coastline_segment_t;
+
+static double wrapped_longitude_delta(double longitude, double center)
+{
+    double delta = longitude - center;
+    while (delta > 180.0)
+        delta -= 360.0;
+    while (delta < -180.0)
+        delta += 360.0;
+    return delta;
+}
+
+static bool clip_segment_to_radar_circle(double *x1, double *y1,
+                                         double *x2, double *y2)
+{
+    const double start_x = *x1;
+    const double start_y = *y1;
+    const double delta_x = *x2 - start_x;
+    const double delta_y = *y2 - start_y;
+    const double a = delta_x * delta_x + delta_y * delta_y;
+    const double c = start_x * start_x + start_y * start_y - 1.0;
+    if (a < 1e-12)
+        return c <= 0.0;
+
+    const double b = 2.0 * (start_x * delta_x + start_y * delta_y);
+    const double discriminant = b * b - 4.0 * a * c;
+    if (discriminant < 0.0)
+        return c <= 0.0;
+
+    const double root = sqrt(discriminant);
+    const double enter = (-b - root) / (2.0 * a);
+    const double leave = (-b + root) / (2.0 * a);
+    const double clipped_start = fmax(0.0, enter);
+    const double clipped_end = fmin(1.0, leave);
+    if (clipped_start > clipped_end)
+        return false;
+
+    *x1 = start_x + delta_x * clipped_start;
+    *y1 = start_y + delta_y * clipped_start;
+    *x2 = start_x + delta_x * clipped_end;
+    *y2 = start_y + delta_y * clipped_end;
     return true;
 }
 
@@ -506,6 +559,151 @@ static void draw_aircraft(const radar_aircraft_t *aircraft, const display_state_
     }
 }
 
+static void draw_coastlines(const display_state_t *snapshot)
+{
+    static coastline_segment_t *segments;
+    static size_t segment_capacity;
+    static size_t segment_count;
+    static double cached_latitude;
+    static double cached_longitude;
+    static double cached_radius_deg;
+    static bool cache_valid;
+    static bool allocation_attempted;
+
+    if (!allocation_attempted)
+    {
+        allocation_attempted = true;
+        segment_capacity = radar_coastline_point_count -
+                           radar_coastline_path_count;
+        segments = heap_caps_malloc(segment_capacity * sizeof(*segments),
+                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!segments)
+            segments = malloc(segment_capacity * sizeof(*segments));
+        if (!segments)
+            ESP_LOGW(DISPLAY_TAG, "Coastline cache allocation failed");
+    }
+    if (!segments)
+        return;
+
+    if (!cache_valid || cached_latitude != snapshot->latitude ||
+        cached_longitude != snapshot->longitude ||
+        cached_radius_deg != snapshot->radius_deg)
+    {
+        segment_count = 0;
+        const double longitude_scale =
+            fmax(0.1, fabs(cos(snapshot->latitude * DEG_TO_RAD)));
+        for (size_t path_index = 0;
+             path_index < radar_coastline_path_count; ++path_index)
+        {
+            const radar_coastline_path_t *path =
+                &radar_coastline_paths[path_index];
+            if (path->point_count < 2 ||
+                path->first_point + path->point_count >
+                    radar_coastline_point_count)
+            {
+                continue;
+            }
+
+            for (uint32_t point_index = 1;
+                 point_index < path->point_count; ++point_index)
+            {
+                const radar_geo_point_t *first =
+                    &radar_coastline_points[path->first_point + point_index - 1];
+                const radar_geo_point_t *second =
+                    &radar_coastline_points[path->first_point + point_index];
+                const double first_latitude =
+                    first->latitude / RADAR_GEO_COORDINATE_SCALE;
+                const double second_latitude =
+                    second->latitude / RADAR_GEO_COORDINATE_SCALE;
+                double first_longitude = wrapped_longitude_delta(
+                    first->longitude / RADAR_GEO_COORDINATE_SCALE,
+                    snapshot->longitude);
+                double second_longitude = wrapped_longitude_delta(
+                    second->longitude / RADAR_GEO_COORDINATE_SCALE,
+                    snapshot->longitude);
+                if (second_longitude - first_longitude > 180.0)
+                    second_longitude -= 360.0;
+                else if (second_longitude - first_longitude < -180.0)
+                    second_longitude += 360.0;
+
+                double x1 = first_longitude * longitude_scale /
+                            snapshot->radius_deg;
+                double y1 = (first_latitude - snapshot->latitude) /
+                            snapshot->radius_deg;
+                double x2 = second_longitude * longitude_scale /
+                            snapshot->radius_deg;
+                double y2 = (second_latitude - snapshot->latitude) /
+                            snapshot->radius_deg;
+                if ((x1 < -1.0 && x2 < -1.0) ||
+                    (x1 > 1.0 && x2 > 1.0) ||
+                    (y1 < -1.0 && y2 < -1.0) ||
+                    (y1 > 1.0 && y2 > 1.0) ||
+                    !clip_segment_to_radar_circle(&x1, &y1, &x2, &y2))
+                {
+                    continue;
+                }
+
+                const int x1_px = RADAR_CENTER +
+                                  (int)lround(x1 * RADAR_RADIUS_PX);
+                const int y1_px = RADAR_CENTER -
+                                  (int)lround(y1 * RADAR_RADIUS_PX);
+                const int x2_px = RADAR_CENTER +
+                                  (int)lround(x2 * RADAR_RADIUS_PX);
+                const int y2_px = RADAR_CENTER -
+                                  (int)lround(y2 * RADAR_RADIUS_PX);
+                if (x1_px == x2_px && y1_px == y2_px)
+                    continue;
+                if (segment_count < segment_capacity)
+                {
+                    segments[segment_count++] = (coastline_segment_t){
+                        .x1 = (int16_t)x1_px,
+                        .y1 = (int16_t)y1_px,
+                        .x2 = (int16_t)x2_px,
+                        .y2 = (int16_t)y2_px,
+                    };
+                }
+            }
+        }
+        cached_latitude = snapshot->latitude;
+        cached_longitude = snapshot->longitude;
+        cached_radius_deg = snapshot->radius_deg;
+        cache_valid = true;
+    }
+
+    const lv_color_t coastline_color = lv_color_hex(0x5688ad);
+    lv_draw_line_dsc_t line;
+    lv_draw_line_dsc_init(&line);
+    line.color = coastline_color;
+    line.width = 1;
+    line.opa = LV_OPA_60;
+    lv_point_t points[64];
+    size_t point_count = 0;
+    for (size_t i = 0; i < segment_count; ++i)
+    {
+        const lv_point_t start = {segments[i].x1, segments[i].y1};
+        const lv_point_t end = {segments[i].x2, segments[i].y2};
+        const bool continues = point_count > 0 &&
+                               points[point_count - 1].x == start.x &&
+                               points[point_count - 1].y == start.y;
+        if (!continues && point_count >= 2)
+        {
+            lv_canvas_draw_line(canvas, points, point_count, &line);
+            point_count = 0;
+        }
+        if (point_count == 0)
+            points[point_count++] = start;
+        if (point_count == sizeof(points) / sizeof(points[0]))
+        {
+            lv_canvas_draw_line(canvas, points, point_count, &line);
+            points[0] = points[point_count - 1];
+            point_count = 1;
+        }
+        points[point_count++] = end;
+    }
+    if (point_count >= 2)
+        lv_canvas_draw_line(canvas, points, point_count, &line);
+}
+
 typedef struct
 {
     uint16_t airport_index;
@@ -812,7 +1010,10 @@ static void render_frame(const display_state_t *snapshot, double sweep_angle)
     draw_line(14, RADAR_CENTER, 346, RADAR_CENTER, dim_green, 1, LV_OPA_60);
     draw_line(RADAR_CENTER, 14, RADAR_CENTER, 346, dim_green, 1, LV_OPA_60);
 
-    draw_airports(snapshot);
+    if (snapshot->show_coastlines)
+        draw_coastlines(snapshot);
+    if (snapshot->show_airports)
+        draw_airports(snapshot);
 
     for (size_t i = 0; i < snapshot->aircraft.count; ++i)
     {
@@ -915,6 +1116,8 @@ void radar_display_init(void)
     state.radius_deg = 0.75;
     state.show_sweep = true;
     state.show_labels = true;
+    state.show_airports = true;
+    state.show_coastlines = false;
     state.wifi_connected = false;
     state.detail_active = false;
     state.selected_icao24[0] = '\0';
@@ -985,7 +1188,8 @@ void radar_display_set_center(double latitude, double longitude, double radius_d
     xSemaphoreGive(state_mutex);
 }
 
-void radar_display_set_options(bool show_sweep, bool show_labels)
+void radar_display_set_options(bool show_sweep, bool show_labels,
+                               bool show_airports, bool show_coastlines)
 {
     xSemaphoreTake(state_mutex, portMAX_DELAY);
     if (state.show_sweep != show_sweep)
@@ -999,6 +1203,8 @@ void radar_display_set_options(bool show_sweep, bool show_labels)
     }
     state.show_sweep = show_sweep;
     state.show_labels = show_labels;
+    state.show_airports = show_airports;
+    state.show_coastlines = show_coastlines;
     xSemaphoreGive(state_mutex);
 }
 

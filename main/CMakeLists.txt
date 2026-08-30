@@ -6,6 +6,7 @@ idf_component_register(
         "board/waveshare_display_port.c"
         "config/radar_config.c"
         "data/airport_data.c"
+        "data/coastline_data.c"
         "hardware/radar_haptics.c"
         "network/radar_network.c"
         "ui/radar_display.c"

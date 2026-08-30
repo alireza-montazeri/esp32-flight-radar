@@ -268,7 +268,8 @@ esp_err_t radar_network_fetch_aircraft(const radar_config_t *config,
         if (!cJSON_IsArray(entry) || !cJSON_IsNumber(cJSON_GetArrayItem(entry, 5)) ||
             !cJSON_IsNumber(cJSON_GetArrayItem(entry, 6))) continue;
         cJSON *ground = cJSON_GetArrayItem(entry, 8);
-        if (cJSON_IsTrue(ground)) continue;
+        const bool on_ground = cJSON_IsTrue(ground);
+        if (on_ground && !config->show_grounded) continue;
 
         radar_aircraft_t *item = &aircraft->items[aircraft->count++];
         copy_json_string(entry, 0, item->icao24, sizeof(item->icao24));
@@ -277,7 +278,7 @@ esp_err_t radar_network_fetch_aircraft(const radar_config_t *config,
         item->longitude = json_number(entry, 5, 0);
         item->latitude = json_number(entry, 6, 0);
         item->altitude_m = json_number(entry, 7, 0);
-        item->on_ground = false;
+        item->on_ground = on_ground;
         item->velocity_mps = json_number(entry, 9, 0);
         item->track_deg = json_number(entry, 10, 0);
         item->vertical_rate_mps = json_number(entry, 11, 0);
@@ -441,12 +442,18 @@ static esp_err_t config_get(httpd_req_t *request)
         "<label>Longitude<input name=longitude type=number min=-180 max=180 step=.000001 value='%.6f' required></label>"
         "<label>Radius in degrees (0.05-2.5)<input name=radius type=number min=.05 max=2.5 step=.05 value='%.2f' required></label>"
         "<label><input style='width:auto' name=sweep type=checkbox %s> animated sweep</label>"
-        "<label><input style='width:auto' name=labels type=checkbox %s> aircraft labels</label></fieldset>"
+        "<label><input style='width:auto' name=labels type=checkbox %s> aircraft labels</label>"
+        "<label><input style='width:auto' name=airports type=checkbox %s> airports</label>"
+        "<label><input style='width:auto' name=coastlines type=checkbox %s> coastlines</label>"
+        "<label><input style='width:auto' name=grounded type=checkbox %s> grounded aircraft</label></fieldset>"
         "<fieldset><legend>OpenSky (optional)</legend><label>OAuth client ID<input name=client_id maxlength=95 value='%s'></label>"
         "<label>OAuth client secret<input name=client_secret type=password maxlength=127></label></fieldset>"
         "<button type=submit>Save and restart</button></form><p>After connection: <b>http://flight-radar.local/</b></p></body></html>",
         current.wifi_ssid, current.latitude, current.longitude, current.radius_deg,
         current.show_sweep ? "checked" : "", current.show_labels ? "checked" : "",
+        current.show_airports ? "checked" : "",
+        current.show_coastlines ? "checked" : "",
+        current.show_grounded ? "checked" : "",
         current.opensky_client_id);
     httpd_resp_set_type(request, "text/html");
     esp_err_t err = httpd_resp_send(request, page, HTTPD_RESP_USE_STRLEN);
@@ -485,6 +492,9 @@ static esp_err_t config_save(httpd_req_t *request)
         strlcpy(updated.opensky_client_secret, value, sizeof(updated.opensky_client_secret));
     updated.show_sweep = strstr(body, "sweep=") != NULL;
     updated.show_labels = strstr(body, "labels=") != NULL;
+    updated.show_airports = strstr(body, "airports=") != NULL;
+    updated.show_coastlines = strstr(body, "coastlines=") != NULL;
+    updated.show_grounded = strstr(body, "grounded=") != NULL;
     free(body);
 
     if (!updated.wifi_ssid[0] || updated.latitude < -90 || updated.latitude > 90 ||
