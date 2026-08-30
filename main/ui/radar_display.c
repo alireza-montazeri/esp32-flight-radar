@@ -11,6 +11,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lvgl.h"
+#include "airport_data.h"
 #include "user_config.h"
 #include "waveshare_display_port.h"
 
@@ -26,6 +27,7 @@
 #define SWEEP_ROTATION_PERIOD_US 15000000.0
 #define RADAR_FRAME_PERIOD_MS 50
 #define KILOMETRES_PER_DEGREE 111.32
+#define RADAR_AIRPORT_LABEL_WIDTH 30
 
 typedef enum
 {
@@ -105,6 +107,36 @@ static bool aircraft_screen_position(const radar_aircraft_t *aircraft,
     const int dy = *y - RADAR_CENTER;
     const int visible_radius = RADAR_RADIUS_PX - 8;
     return dx * dx + dy * dy <= visible_radius * visible_radius;
+}
+
+static bool airport_screen_position(const radar_airport_t *airport,
+                                    const display_state_t *snapshot,
+                                    double longitude_scale, int *x, int *y,
+                                    double *distance_squared)
+{
+    const double latitude_delta = airport->latitude - snapshot->latitude;
+    double longitude_delta = airport->longitude - snapshot->longitude;
+    if (longitude_delta > 180.0)
+        longitude_delta -= 360.0;
+    else if (longitude_delta < -180.0)
+        longitude_delta += 360.0;
+
+    if (fabs(latitude_delta) > snapshot->radius_deg ||
+        fabs(longitude_delta) * longitude_scale > snapshot->radius_deg)
+    {
+        return false;
+    }
+
+    const double x_norm = longitude_delta * longitude_scale /
+                          snapshot->radius_deg;
+    const double y_norm = latitude_delta / snapshot->radius_deg;
+    *distance_squared = x_norm * x_norm + y_norm * y_norm;
+    if (*distance_squared > 1.0)
+        return false;
+
+    *x = RADAR_CENTER + (int)lround(x_norm * RADAR_RADIUS_PX);
+    *y = RADAR_CENTER - (int)lround(y_norm * RADAR_RADIUS_PX);
+    return true;
 }
 
 static double aircraft_bearing(double latitude, double longitude,
@@ -324,6 +356,20 @@ static void draw_text_single_line(int x, int y, int width, const char *text,
     lv_canvas_draw_text(canvas, x, y, width, &dsc, text);
 }
 
+static void draw_text_single_line_font(int x, int y, int width,
+                                       const char *text, lv_color_t color,
+                                       lv_text_align_t align,
+                                       const lv_font_t *font)
+{
+    lv_draw_label_dsc_t dsc;
+    lv_draw_label_dsc_init(&dsc);
+    dsc.color = color;
+    dsc.font = font;
+    dsc.align = align;
+    dsc.flag |= LV_TEXT_FLAG_EXPAND;
+    lv_canvas_draw_text(canvas, x, y, width, &dsc, text);
+}
+
 static bool text_fits_detail_row(const char *text, int width)
 {
     return lv_txt_get_width(text, strlen(text), &lv_font_montserrat_12, 0,
@@ -457,6 +503,94 @@ static void draw_aircraft(const radar_aircraft_t *aircraft, const display_state_
         const char *name = aircraft->callsign[0] ? aircraft->callsign : aircraft->icao24;
         snprintf(label, sizeof(label), "%s", name);
         draw_text(x + 8, y - 7, 112, label, lv_color_hex(0x7dff9d), LV_TEXT_ALIGN_LEFT);
+    }
+}
+
+typedef struct
+{
+    uint16_t airport_index;
+    int16_t x;
+    int16_t y;
+} visible_airport_t;
+
+static void draw_airports(const display_state_t *snapshot)
+{
+    static visible_airport_t *visible;
+    static size_t visible_count;
+    static double cached_latitude;
+    static double cached_longitude;
+    static double cached_radius_deg;
+    static bool cache_valid;
+    static bool allocation_attempted;
+
+    if (!allocation_attempted)
+    {
+        allocation_attempted = true;
+        visible = heap_caps_malloc(radar_airport_count * sizeof(*visible),
+                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!visible)
+            visible = malloc(radar_airport_count * sizeof(*visible));
+        if (!visible)
+            ESP_LOGW(DISPLAY_TAG, "Airport display cache allocation failed");
+    }
+    if (!visible)
+        return;
+
+    if (!cache_valid || cached_latitude != snapshot->latitude ||
+        cached_longitude != snapshot->longitude ||
+        cached_radius_deg != snapshot->radius_deg)
+    {
+        visible_count = 0;
+        const double longitude_scale =
+            fmax(0.1, fabs(cos(snapshot->latitude * DEG_TO_RAD)));
+        for (size_t i = 0; i < radar_airport_count; ++i)
+        {
+            int x;
+            int y;
+            double distance_squared;
+            if (airport_screen_position(&radar_airports[i], snapshot,
+                                        longitude_scale, &x, &y,
+                                        &distance_squared))
+            {
+                visible[visible_count++] = (visible_airport_t){
+                    .airport_index = (uint16_t)i,
+                    .x = (int16_t)x,
+                    .y = (int16_t)y,
+                };
+            }
+        }
+        cached_latitude = snapshot->latitude;
+        cached_longitude = snapshot->longitude;
+        cached_radius_deg = snapshot->radius_deg;
+        cache_valid = true;
+    }
+
+    const lv_color_t marker_color = lv_color_white();
+    for (size_t i = visible_count; i > 0; --i)
+    {
+        const visible_airport_t *airport = &visible[i - 1];
+        draw_text_single_line_font(airport->x - 6, airport->y - 6, 12,
+                                   LV_SYMBOL_PLUS, marker_color,
+                                   LV_TEXT_ALIGN_CENTER,
+                                   &lv_font_montserrat_10);
+    }
+
+    for (size_t i = 0; i < visible_count; ++i)
+    {
+        const visible_airport_t *airport = &visible[i];
+        const int label_width = RADAR_AIRPORT_LABEL_WIDTH;
+        const int label_x = airport->x < RADAR_CENTER
+                                ? airport->x + 6
+                                : airport->x - label_width - 6;
+        int label_y = airport->y - 6;
+        if (label_y < 24)
+            label_y = 24;
+        else if (label_y > 326)
+            label_y = 326;
+        draw_text_single_line_font(
+            label_x, label_y, label_width,
+            radar_airports[airport->airport_index].code, lv_color_white(),
+            LV_TEXT_ALIGN_CENTER, &lv_font_montserrat_10);
     }
 }
 
@@ -677,6 +811,8 @@ static void render_frame(const display_state_t *snapshot, double sweep_angle)
     lv_canvas_draw_arc(canvas, RADAR_CENTER, RADAR_CENTER, RADAR_RADIUS_PX, 0, 360, &arc);
     draw_line(14, RADAR_CENTER, 346, RADAR_CENTER, dim_green, 1, LV_OPA_60);
     draw_line(RADAR_CENTER, 14, RADAR_CENTER, 346, dim_green, 1, LV_OPA_60);
+
+    draw_airports(snapshot);
 
     for (size_t i = 0; i < snapshot->aircraft.count; ++i)
     {

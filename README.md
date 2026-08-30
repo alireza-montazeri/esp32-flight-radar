@@ -13,6 +13,7 @@ would also require an SDR or dedicated ADS-B RF front end and antenna.
 ## Features
 
 - Live OpenSky aircraft positions inside a configurable bounding box
+- Nearby scheduled-service airport markers from a bundled offline database
 - Aircraft heading, callsign or ICAO address, and altitude
 - Position prediction between API updates
 - First-boot Wi-Fi, location, display, and OpenSky setup page
@@ -244,6 +245,7 @@ anonymous access.
 
 After Wi-Fi connection, the radar fetches nearby aircraft and shows:
 
+- White plus airport markers with white IATA/ICAO labels inside the radar circle
 - Green aircraft symbols for airborne aircraft
 - Aircraft reported by OpenSky as on the ground are excluded
 - GPS-style aircraft symbols rotated to the nearest of 16 heading directions
@@ -287,6 +289,27 @@ If a callsign is unavailable, the ADSBDB request omits the query string and uses
 OpenSky OAuth is skipped when no credentials are configured; the live states
 request is then anonymous. The local setup page and mDNS service are hosted by
 the ESP32 and are not external API calls.
+
+### Airport data
+
+Nearby airports do not require an API call. The firmware bundles a compact list
+of airports with scheduled service, generated from the public-domain
+[OurAirports dataset](https://ourairports.com/data/). Airport coordinates remain
+in degrees and use the same circular projection as aircraft. Every scheduled
+airport inside the radar circle is drawn with a compact white code; labels are
+intentionally allowed to overlap in dense areas.
+
+To refresh the bundled dataset from the latest `airports.csv`, run from the
+repository root:
+
+```powershell
+python tools/generate_airport_data.py
+```
+
+The generated `main/data/airport_data.c` is committed with the project, so this
+command is not required for a normal or offline firmware build. You can also
+regenerate from a downloaded CSV with
+`python tools/generate_airport_data.py --source path/to/airports.csv`.
 
 Controls:
 
@@ -436,10 +459,12 @@ components from the manifest and lock file during the next build.
 - `main/app` - startup orchestration, knob control, and radar polling
 - `main/board` - verified pins and Waveshare SH8601/LVGL display port
 - `main/config` - persistent NVS configuration
+- `main/data` - generated offline scheduled-airport coordinates
 - `main/hardware` - DRV2605 haptic control
 - `main/model` - shared aircraft data structures
 - `main/network` - Wi-Fi, web setup, HTTPS, OAuth, and OpenSky parsing
 - `main/ui` - LVGL radar renderer
+- `tools` - optional airport-data regeneration utility
 - `components` - local I2C, touch, backlight, and encoder components
 - `Documents/schematics` - board schematics
 
