@@ -1,0 +1,401 @@
+# ESP32 Flight Radar
+
+An Internet-connected aircraft radar display for the Waveshare
+[ESP32-S3-Knob-Touch-LCD-1.8](https://www.waveshare.com/wiki/ESP32-S3-Knob-Touch-LCD-1.8),
+built with ESP-IDF and live data from the
+[OpenSky Network REST API](https://openskynetwork.github.io/opensky-api/rest.html).
+
+The application uses the board's 360 x 360 SH8601 QSPI display, capacitive
+touch panel, rotary encoder, and DRV2605 vibration motor. It is an Internet
+flight tracker, not a 1090 MHz ADS-B radio receiver. A completely local receiver
+would also require an SDR or dedicated ADS-B RF front end and antenna.
+
+## Features
+
+- Live OpenSky aircraft positions inside a configurable bounding box
+- Aircraft heading, callsign or ICAO address, and altitude
+- Position prediction between API updates
+- First-boot Wi-Fi, location, display, and OpenSky setup page
+- Configuration stored persistently in ESP32 NVS
+- Anonymous OpenSky access or automatic OAuth2 client-credential authentication
+- Knob-controlled radar radius from 0.05 to 2.5 degrees
+- DRV2605 tactile click feedback while turning the knob
+- Touch control for showing or hiding aircraft labels
+- Animated radar sweep
+- Local configuration page at `http://flight-radar.local/`
+
+## Hardware
+
+Required:
+
+- Waveshare ESP32-S3-Knob-Touch-LCD-1.8
+- A USB-C data cable
+- A 2.4 GHz Wi-Fi network with Internet access
+- Windows, Linux, or macOS computer for building and flashing
+
+No external display, touch, encoder, or vibration-motor wiring is required.
+The verified onboard connections are:
+
+| Function | Connection |
+|---|---|
+| LCD QSPI clock | GPIO 13 |
+| LCD chip select | GPIO 14 |
+| LCD data 0-3 | GPIO 15, 16, 17, 18 |
+| LCD reset | GPIO 21 |
+| LCD backlight PWM | GPIO 47 |
+| I2C SDA | GPIO 11 |
+| I2C SCL | GPIO 12 |
+| Touch controller | I2C address `0x15` |
+| DRV2605 haptic driver | I2C address `0x5A` |
+| Encoder A/B | GPIO 8 and GPIO 7 |
+| Touch reset/interrupt | GPIO 10 and GPIO 9, reserved by the board definition |
+
+The authoritative project pin definitions are in
+[`main/board/user_config.h`](main/board/user_config.h), and the supplied board
+schematics are retained under [`Documents/schematics`](Documents/schematics).
+
+## Software prerequisites
+
+This project is tested with **ESP-IDF 6.0.2**. Install and activate that version
+before building. Espressif's
+[ESP32-S3 getting-started guide](https://docs.espressif.com/projects/esp-idf/en/release-v6.0/esp32s3/get-started/index.html)
+describes installation for Windows, Linux, and macOS.
+
+On Windows, open the ESP-IDF terminal installed by Espressif rather than an
+ordinary PowerShell window. You can confirm the environment with:
+
+```powershell
+idf.py --version
+```
+
+The project path and ESP-IDF installation path should not contain spaces.
+
+## Clone and build
+
+```powershell
+git clone https://github.com/YOUR_USERNAME/esp32-flight-radar.git
+cd esp32-flight-radar
+idf.py build
+```
+
+Replace the example repository URL with the real GitHub URL.
+
+The committed [`sdkconfig`](sdkconfig) is the exact known-working configuration
+for this board. [`sdkconfig.defaults`](sdkconfig.defaults) retains the important
+board-specific defaults for regenerating it. If `sdkconfig` is intentionally
+removed, regenerate it with:
+
+```powershell
+idf.py set-target esp32s3
+idf.py build
+```
+
+During configuration, ESP-IDF automatically reads
+[`main/idf_component.yml`](main/idf_component.yml), resolves
+[`dependencies.lock`](dependencies.lock), and downloads LVGL, cJSON, mDNS, and
+the SH8601 driver into the ignored `managed_components/` directory. The
+[ESP-IDF Component Manager](https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/api-guides/tools/idf-component-manager.html)
+performs this automatically; do not copy or commit `managed_components/`.
+
+The board-specific I2C, touch, backlight, and encoder sources under
+[`components/`](components) are local components and must remain in the
+repository because they describe this board's wiring and external devices.
+
+A successful build produces:
+
+- `build/flight-radar.bin`
+- `build/bootloader/bootloader.bin`
+- `build/partition_table/partition-table.bin`
+
+The custom [`partitions.csv`](partitions.csv) reserves 6 MB for the factory
+application while retaining NVS and PHY partitions.
+
+## Find the ESP32-S3 serial port
+
+On Windows, inspect **Device Manager > Ports (COM & LPT)** before and after
+connecting the board. Use the newly appearing ESP32-S3 port, such as `COM6`.
+
+This board can expose a different ESP chip depending on the USB-C plug
+orientation at the board. If flashing reports:
+
+```text
+This chip is ESP32, not ESP32-S3. Wrong chip argument?
+```
+
+unplug the cable, rotate the USB-C plug 180 degrees at the board, reconnect it,
+and select the new COM port. A correct ESP32-S3 boot log begins with something
+similar to:
+
+```text
+ESP-ROM:esp32s3
+```
+
+## Flash and monitor
+
+Replace `COM6` with the ESP32-S3 port found on your computer:
+
+```powershell
+idf.py -p COM6 flash monitor
+```
+
+`flash` builds if necessary, writes the bootloader, partition table, and
+application, then resets the board. `monitor` opens the serial log at 115200
+baud. Exit the monitor with **Ctrl+]**. These are the standard
+[ESP-IDF build, flash, and monitor commands](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/get-started/start-project.html).
+
+If the board remains at:
+
+```text
+waiting for download
+```
+
+release the BOOT button and press RESET, or disconnect and reconnect power
+without holding BOOT.
+
+## First-boot Wi-Fi setup
+
+When no Wi-Fi credentials are stored, the screen displays:
+
+```text
+Join FlightRadar-Setup - 192.168.4.1
+```
+
+1. On a phone or computer, connect to the open Wi-Fi network
+   **FlightRadar-Setup**.
+2. The network intentionally has no Internet access. If the device tries to
+   leave it automatically, choose the option to remain connected.
+3. Disable a VPN temporarily if it prevents access to local addresses.
+4. Open **`http://192.168.4.1/`** in a browser. Use `http://`, not
+   `https://`.
+5. Complete the configuration form and select **Save and restart**.
+
+If the page does not open, verify that the phone or computer is actually
+connected to `FlightRadar-Setup`. Traffic for `192.168.4.1` must go through
+that Wi-Fi connection rather than Ethernet, cellular data, or a VPN.
+
+### Configuration fields
+
+| Field | What to enter |
+|---|---|
+| Wi-Fi SSID | Exact name of the 2.4 GHz network |
+| Wi-Fi password | Network password; blank retains an already stored password |
+| Latitude | Radar centre in signed decimal degrees, from -90 to 90 |
+| Longitude | Radar centre in signed decimal degrees, from -180 to 180 |
+| Radius | 0.05 to 2.5 degrees |
+| Animated sweep | Enables the rotating green radar line |
+| Aircraft labels | Shows callsign/ICAO address and altitude |
+| OAuth client ID | Optional OpenSky API client ID |
+| OAuth client secret | Optional OpenSky API client secret; blank retains the stored secret |
+
+The board does not obtain its location automatically. Enter the decimal-degree
+coordinates for the centre of the area you want to observe. South and west
+coordinates are negative. Do not commit your actual coordinates to the
+repository; enter them only through the device's setup page, where they are
+stored in NVS flash.
+
+A radius of 0.05 degrees is approximately 5.6 km north/south. East/west distance
+varies with latitude and is approximately `5.6 × cos(latitude)` km. The default
+radius of 0.75 degrees is approximately 83 km north/south.
+
+After saving, the ESP32 restarts and attempts to join the configured Wi-Fi
+network. If it cannot connect within approximately 20 seconds, it enables
+`FlightRadar-Setup` again so the settings can be corrected.
+
+## OpenSky account and OAuth credentials
+
+OpenSky credentials are optional. Leaving both OAuth fields empty uses anonymous
+access.
+
+To enable authenticated access:
+
+1. Create or sign in to an account at
+   [OpenSky Network](https://opensky-network.org/).
+2. Open the [OpenSky account page](https://opensky-network.org/my-opensky/account).
+3. Find the **API Client** section and create an API client.
+4. Copy the generated `client_id` into **OAuth client ID** on the radar setup
+   page.
+5. Copy the generated `client_secret` into **OAuth client secret**.
+6. Save the form and allow the radar to restart.
+
+Do not enter the normal OpenSky website username and password. OpenSky's REST
+API exclusively uses the OAuth2 client-credentials flow. The firmware exchanges
+the client ID and secret for a bearer token and refreshes it automatically; you
+do not need to obtain or paste an access token manually. See the official
+[OpenSky authentication documentation](https://openskynetwork.github.io/opensky-api/rest.html#authentication).
+
+The firmware's request schedule is designed around OpenSky's documented credit
+allowances:
+
+| Mode | Firmware interval | OpenSky daily allowance |
+|---|---:|---:|
+| Anonymous | 220 seconds | 400 credits |
+| Standard authenticated user | 22 seconds | 4,000 credits |
+
+The maximum configured bounding box is 5 by 5 degrees, or 25 square degrees, so
+each `/states/all` request costs one credit under the current
+[OpenSky API credit rules](https://openskynetwork.github.io/opensky-api/rest.html#api-credits).
+If OAuth authentication fails, the firmware logs a warning and continues using
+anonymous access.
+
+## Normal operation
+
+After Wi-Fi connection, the radar fetches nearby aircraft and shows:
+
+- Green aircraft symbols for airborne aircraft
+- Amber aircraft symbols for aircraft reported on the ground
+- Aircraft heading through symbol orientation
+- Callsign, or ICAO24 address when no callsign is available
+- Barometric altitude in feet
+- Aircraft count, selected range, connection state, and update status
+
+Controls:
+
+| Control | Action |
+|---|---|
+| Rotate knob | Increase or decrease radar radius by 0.05 degrees |
+| Knob vibration | Confirms a detected rotation step |
+| Touch display | Toggle aircraft labels for the current session |
+
+The selected knob radius is written to NVS after the knob has been idle for
+approximately 1.5 seconds. The touch label toggle lasts until restart; the
+default label option can be changed through the web setup page.
+
+Aircraft movement is projected between OpenSky responses using reported
+velocity and track. This makes movement smoother but does not create new
+position data.
+
+## Reopen or change configuration
+
+While the radar is connected to the normal Wi-Fi network, browse to:
+
+```text
+http://flight-radar.local/
+```
+
+The phone or computer must be on the same local network. If the `.local`
+address is not supported by the router or client, find the radar's IP address in
+the router's connected-device list and open:
+
+```text
+http://RADAR_IP_ADDRESS/
+```
+
+Blank Wi-Fi password and OAuth secret fields retain their existing stored
+values. Saving any changes restarts the radar.
+
+Normal firmware flashing does not erase NVS, so saved settings ordinarily
+survive a firmware update.
+
+## Reset all stored settings
+
+To erase Wi-Fi, location, OpenSky credentials, and the installed firmware:
+
+```powershell
+idf.py -p COM6 erase-flash
+```
+
+Then reinstall the application:
+
+```powershell
+idf.py -p COM6 flash monitor
+```
+
+This is destructive: `erase-flash` clears the entire ESP32-S3 flash, including
+NVS.
+
+## Troubleshooting
+
+### Wrong-chip error
+
+```text
+This chip is ESP32, not ESP32-S3
+```
+
+Use the other USB-C orientation at the board and select the newly appearing
+ESP32-S3 COM port.
+
+### Setup page does not open
+
+- Connect specifically to `FlightRadar-Setup`.
+- Use `http://192.168.4.1/`, not HTTPS.
+- Ignore the phone or computer's “no Internet” warning.
+- Temporarily disable VPN, cellular fallback, or another active network route.
+
+### Radar connects but shows no aircraft
+
+- Confirm the configured latitude and longitude signs.
+- Increase the radius with the knob.
+- Confirm that the Wi-Fi network has Internet access.
+- OpenSky coverage varies by region and aircraft altitude.
+- Watch the serial monitor for the HTTP status and error name.
+
+### OpenSky HTTP 401
+
+The client ID or secret is invalid, or token acquisition failed. Reopen the
+configuration page and copy the API-client credentials again. Do not use the
+normal account password.
+
+### OpenSky HTTP 429
+
+The OpenSky credit allowance has been exhausted. Wait for the allowance to
+refill. Avoid modifying the firmware to poll more frequently than the configured
+interval.
+
+### Haptic feedback is absent
+
+Check the monitor for:
+
+```text
+radar_haptics: DRV2605 ready (effect 5: sharp click 60%)
+```
+
+A “DRV2605 not detected” warning indicates an I2C/device initialization problem;
+the rest of the radar continues running without haptics.
+
+### Rebuild downloaded dependencies
+
+```powershell
+idf.py fullclean
+idf.py build
+```
+
+`fullclean` removes generated build state. ESP-IDF then restores managed
+components from the manifest and lock file during the next build.
+
+## Configuration and generated files
+
+| Path | Version-control policy |
+|---|---|
+| `sdkconfig` | Commit: exact known-working configuration |
+| `sdkconfig.defaults` | Commit: intentional board defaults |
+| `sdkconfig.old` | Ignore: local backup |
+| `dependencies.lock` | Commit: resolved managed-component versions |
+| `managed_components/` | Ignore: downloaded automatically |
+| `build/` | Ignore: generated output |
+| `components/` | Commit: local Waveshare board support |
+| `Documents/schematics/` | Commit: hardware reference |
+| Other `Documents/` content | Ignore: not required to build |
+
+## Project layout
+
+- `main/main.c` - minimal ESP-IDF entry point
+- `main/app` - startup orchestration, knob control, and radar polling
+- `main/board` - verified pins and Waveshare SH8601/LVGL display port
+- `main/config` - persistent NVS configuration
+- `main/hardware` - DRV2605 haptic control
+- `main/model` - shared aircraft data structures
+- `main/network` - Wi-Fi, web setup, HTTPS, OAuth, and OpenSky parsing
+- `main/ui` - LVGL radar renderer
+- `components` - local I2C, touch, backlight, and encoder components
+- `Documents/schematics` - board schematics
+
+## Security and limitations
+
+- `FlightRadar-Setup` is intentionally an open access point.
+- The setup page uses plain HTTP on the local network.
+- Wi-Fi and OpenSky credentials are stored in ordinary, unencrypted NVS.
+- OpenSky traffic uses HTTPS and ESP-IDF's certificate bundle.
+- At most 64 aircraft are rendered.
+- Aircraft without a reported latitude or longitude are ignored.
+- OpenSky coverage and update timing determine what appears on screen.
+- This project does not directly receive ADS-B radio transmissions.

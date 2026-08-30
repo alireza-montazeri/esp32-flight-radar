@@ -1,0 +1,15 @@
+version: 1.0.0
+
+dependencies:
+  espressif/cjson:
+    version: "^1.7.19"
+    public: true
+  espressif/mdns:
+    version: "*"
+    public: true
+  esp_lcd_sh8601:
+    version: "*"
+    public: true
+  lvgl/lvgl:
+    version: "8.4.0"
+    public: true

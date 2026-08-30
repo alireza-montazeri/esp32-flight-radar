@@ -1,0 +1,75 @@
+# IDEs and development containers
+.vscode/
+.devcontainer/
+.idea/
+*.code-workspace
+*.workspace
+*.user
+*.suo
+*.sln.docstates
+
+# Language-server and Clang indexes
+.clangd
+.clangd/
+.ccls-cache/
+.cache/clangd/
+compile_commands.json
+
+# ESP-IDF generated configuration and build output
+sdkconfig.old
+**/build/
+build/
+*.bin
+*.elf
+*.map
+*.o
+*.a
+*.out
+*.exe
+flasher_args.json
+
+# ESP-IDF Component Manager downloads
+managed_components/
+/components/.idf/
+**/components/.idf/
+.espressif/
+
+# Reference documents: publish schematics only
+Documents/*
+!Documents/schematics/
+!Documents/schematics/**
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+
+# Python caches and environments
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+*.egg-info/
+dist/
+venv/
+.venv/
+env/
+
+# Logs and temporary files
+*.log
+*~
+*.swp
+*.swo
+*.bak
+*.tmp
+
+# Operating-system metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+.directory
+Thumbs.db
+ehthumbs.db
+Desktop.ini
