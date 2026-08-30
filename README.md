@@ -20,7 +20,9 @@ would also require an SDR or dedicated ADS-B RF front end and antenna.
 - Anonymous OpenSky access or automatic OAuth2 client-credential authentication
 - Knob-controlled radar radius from 0.05 to 2.5 degrees
 - DRV2605 tactile click feedback while turning the knob
-- Touch control for showing or hiding aircraft labels
+- Tap an aircraft for live flight details; tap again to close
+- Knob selection between visible aircraft while the detail card is open
+- On-demand airline/company and route enrichment
 - Animated radar sweep
 - Local configuration page at `http://flight-radar.local/`
 
@@ -36,18 +38,18 @@ Required:
 No external display, touch, encoder, or vibration-motor wiring is required.
 The verified onboard connections are:
 
-| Function | Connection |
-|---|---|
-| LCD QSPI clock | GPIO 13 |
-| LCD chip select | GPIO 14 |
-| LCD data 0-3 | GPIO 15, 16, 17, 18 |
-| LCD reset | GPIO 21 |
-| LCD backlight PWM | GPIO 47 |
-| I2C SDA | GPIO 11 |
-| I2C SCL | GPIO 12 |
-| Touch controller | I2C address `0x15` |
-| DRV2605 haptic driver | I2C address `0x5A` |
-| Encoder A/B | GPIO 8 and GPIO 7 |
+| Function              | Connection                                           |
+| --------------------- | ---------------------------------------------------- |
+| LCD QSPI clock        | GPIO 13                                              |
+| LCD chip select       | GPIO 14                                              |
+| LCD data 0-3          | GPIO 15, 16, 17, 18                                  |
+| LCD reset             | GPIO 21                                              |
+| LCD backlight PWM     | GPIO 47                                              |
+| I2C SDA               | GPIO 11                                              |
+| I2C SCL               | GPIO 12                                              |
+| Touch controller      | I2C address `0x15`                                   |
+| DRV2605 haptic driver | I2C address `0x5A`                                   |
+| Encoder A/B           | GPIO 8 and GPIO 7                                    |
 | Touch reset/interrupt | GPIO 10 and GPIO 9, reserved by the board definition |
 
 The authoritative project pin definitions are in
@@ -73,12 +75,10 @@ The project path and ESP-IDF installation path should not contain spaces.
 ## Clone and build
 
 ```powershell
-git clone https://github.com/YOUR_USERNAME/esp32-flight-radar.git
+git clone https://github.com/alireza-montazeri/esp32-flight-radar
 cd esp32-flight-radar
 idf.py build
 ```
-
-Replace the example repository URL with the real GitHub URL.
 
 The committed [`sdkconfig`](sdkconfig) is the exact known-working configuration
 for this board. [`sdkconfig.defaults`](sdkconfig.defaults) retains the important
@@ -175,16 +175,16 @@ that Wi-Fi connection rather than Ethernet, cellular data, or a VPN.
 
 ### Configuration fields
 
-| Field | What to enter |
-|---|---|
-| Wi-Fi SSID | Exact name of the 2.4 GHz network |
-| Wi-Fi password | Network password; blank retains an already stored password |
-| Latitude | Radar centre in signed decimal degrees, from -90 to 90 |
-| Longitude | Radar centre in signed decimal degrees, from -180 to 180 |
-| Radius | 0.05 to 2.5 degrees |
-| Animated sweep | Enables the rotating green radar line |
-| Aircraft labels | Shows callsign/ICAO address and altitude |
-| OAuth client ID | Optional OpenSky API client ID |
+| Field               | What to enter                                                       |
+| ------------------- | ------------------------------------------------------------------- |
+| Wi-Fi SSID          | Exact name of the 2.4 GHz network                                   |
+| Wi-Fi password      | Network password; blank retains an already stored password          |
+| Latitude            | Radar centre in signed decimal degrees, from -90 to 90              |
+| Longitude           | Radar centre in signed decimal degrees, from -180 to 180            |
+| Radius              | 0.05 to 2.5 degrees                                                 |
+| Animated sweep      | Enables the rotating green radar line                               |
+| Aircraft labels     | Shows callsign/ICAO address and altitude                            |
+| OAuth client ID     | Optional OpenSky API client ID                                      |
 | OAuth client secret | Optional OpenSky API client secret; blank retains the stored secret |
 
 The board does not obtain its location automatically. Enter the decimal-degree
@@ -226,10 +226,10 @@ do not need to obtain or paste an access token manually. See the official
 The firmware's request schedule is designed around OpenSky's documented credit
 allowances:
 
-| Mode | Firmware interval | OpenSky daily allowance |
-|---|---:|---:|
-| Anonymous | 220 seconds | 400 credits |
-| Standard authenticated user | 22 seconds | 4,000 credits |
+| Mode                        | Firmware interval | OpenSky daily allowance |
+| --------------------------- | ----------------: | ----------------------: |
+| Anonymous                   |       220 seconds |             400 credits |
+| Standard authenticated user |        60 seconds |           4,000 credits |
 
 The maximum configured bounding box is 5 by 5 degrees, or 25 square degrees, so
 each `/states/all` request costs one credit under the current
@@ -246,19 +246,58 @@ After Wi-Fi connection, the radar fetches nearby aircraft and shows:
 - Aircraft heading through symbol orientation
 - Callsign, or ICAO24 address when no callsign is available
 - Barometric altitude in feet
-- Aircraft count, selected range, connection state, and update status
+- Icon-based aircraft count, selected range, connection state, and update status
+
+Opening the detail card starts a best-effort lookup through the public
+[ADSBDB API](https://github.com/mrjackwills/adsbdb). No additional API key is
+required. The card shows the selected aircraft number out of the visible total,
+flight/callsign, altitude with vertical speed, speed, and heading with a compass
+direction. When available, ADSBDB also adds the airline or owner and separate
+aircraft manufacturer and type below it, followed by origin and destination
+entries on one line containing each airport code and city name. After a
+completed lookup with no company, aircraft information, or route result, the
+card displays `No additional detail found`.
+The lookup sends only the selected aircraft's public ICAO24 address and
+callsign. Results are cached in RAM for the current session.
+
+Aircraft and route metadata may be incomplete or incorrect. Routes are inferred
+from callsigns and are commonly unavailable for private, charter, military, or
+callsign-changing flights. A failed enrichment lookup does not interrupt live
+OpenSky tracking.
+
+HTTPS requests are serialized to limit ESP32 memory pressure. OpenSky requests
+have a 20-second total deadline and failed updates retry after 10 seconds.
+Optional ADSBDB enrichment has an 8-second deadline.
+
+### External API calls
+
+The firmware calls only OpenSky and ADSBDB. The exact external requests are:
+
+| Provider | Method | Endpoint | Purpose |
+| -------- | ------ | -------- | ------- |
+| OpenSky | `POST` | `https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token` | Obtain an OAuth access token when a client ID and secret are configured |
+| OpenSky | `GET` | `https://opensky-network.org/api/states/all?lamin={south}&lamax={north}&lomin={west}&lomax={east}&extended=1` | Fetch live aircraft state vectors inside the configured radar area |
+| ADSBDB | `GET` | `https://api.adsbdb.com/v0/aircraft/{ICAO24}?callsign={CALLSIGN}` | Look up optional aircraft, airline, origin, and destination metadata for the selected aircraft |
+
+If a callsign is unavailable, the ADSBDB request omits the query string and uses
+`https://api.adsbdb.com/v0/aircraft/{ICAO24}`. ADSBDB does not require a key.
+OpenSky OAuth is skipped when no credentials are configured; the live states
+request is then anonymous. The local setup page and mDNS service are hosted by
+the ESP32 and are not external API calls.
 
 Controls:
 
-| Control | Action |
-|---|---|
-| Rotate knob | Increase or decrease radar radius by 0.05 degrees |
-| Knob vibration | Confirms a detected rotation step |
-| Touch display | Toggle aircraft labels for the current session |
+| Control                    | Action                                            |
+| -------------------------- | ------------------------------------------------- |
+| Rotate knob                | Increase or decrease radar radius by 0.05 degrees |
+| Knob vibration             | Confirms a detected rotation step                 |
+| Tap an aircraft            | Open its live detail card                         |
+| Rotate knob with card open | Select the previous or next visible aircraft      |
+| Tap while card is open     | Close the detail card                             |
 
 The selected knob radius is written to NVS after the knob has been idle for
-approximately 1.5 seconds. The touch label toggle lasts until restart; the
-default label option can be changed through the web setup page.
+approximately 1.5 seconds. Opening and closing the detail card does not change
+the configured aircraft-label setting.
 
 Aircraft movement is projected between OpenSky responses using reported
 velocity and track. This makes movement smoother but does not create new
@@ -329,6 +368,16 @@ ESP32-S3 COM port.
 - OpenSky coverage varies by region and aircraft altitude.
 - Watch the serial monitor for the HTTP status and error name.
 
+### Company or route is unavailable
+
+- Wait briefly after selecting the aircraft; lookup starts after a short knob
+  selection debounce.
+- Confirm the network permits HTTPS access to `api.adsbdb.com`.
+- Some aircraft are not present in the metadata database, and some callsigns do
+  not map to a known route.
+- Core position, altitude, speed, and heading data still come from OpenSky and
+  remain available when enrichment fails.
+
 ### OpenSky HTTP 401
 
 The client ID or secret is invalid, or token acquisition failed. Reopen the
@@ -364,17 +413,17 @@ components from the manifest and lock file during the next build.
 
 ## Configuration and generated files
 
-| Path | Version-control policy |
-|---|---|
-| `sdkconfig` | Commit: exact known-working configuration |
-| `sdkconfig.defaults` | Commit: intentional board defaults |
-| `sdkconfig.old` | Ignore: local backup |
-| `dependencies.lock` | Commit: resolved managed-component versions |
-| `managed_components/` | Ignore: downloaded automatically |
-| `build/` | Ignore: generated output |
-| `components/` | Commit: local Waveshare board support |
-| `Documents/schematics/` | Commit: hardware reference |
-| Other `Documents/` content | Ignore: not required to build |
+| Path                       | Version-control policy                      |
+| -------------------------- | ------------------------------------------- |
+| `sdkconfig`                | Commit: exact known-working configuration   |
+| `sdkconfig.defaults`       | Commit: intentional board defaults          |
+| `sdkconfig.old`            | Ignore: local backup                        |
+| `dependencies.lock`        | Commit: resolved managed-component versions |
+| `managed_components/`      | Ignore: downloaded automatically            |
+| `build/`                   | Ignore: generated output                    |
+| `components/`              | Commit: local Waveshare board support       |
+| `Documents/schematics/`    | Commit: hardware reference                  |
+| Other `Documents/` content | Ignore: not required to build               |
 
 ## Project layout
 

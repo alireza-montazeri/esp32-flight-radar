@@ -19,6 +19,7 @@
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "mdns.h"
 #include "radar_display.h"
 
@@ -36,6 +37,7 @@ typedef struct {
 
 static const char *TAG = "radar_network";
 static EventGroupHandle_t wifi_events;
+static SemaphoreHandle_t http_mutex;
 static int wifi_retries;
 static bool connected;
 static bool setup_ap;
@@ -77,22 +79,33 @@ static esp_err_t http_event(esp_http_client_event_t *event)
 
 static esp_err_t perform_http(const char *url, esp_http_client_method_t method,
                               const char *body, const char *bearer,
-                              response_buffer_t *response, int *status)
+                              response_buffer_t *response, int *status,
+                              int total_timeout_ms)
 {
     memset(response, 0, sizeof(*response));
+    *status = 0;
+    if (!http_mutex ||
+        xSemaphoreTake(http_mutex, pdMS_TO_TICKS(total_timeout_ms)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
     esp_http_client_config_t config = {
         .url = url,
         .method = method,
-        .timeout_ms = 20000,
+        .timeout_ms = 2000,
         .buffer_size = 4096,
         .buffer_size_tx = 2048,
         .event_handler = http_event,
         .user_data = response,
         .crt_bundle_attach = esp_crt_bundle_attach,
         .keep_alive_enable = true,
+        .is_async = true,
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (!client) return ESP_ERR_NO_MEM;
+    if (!client) {
+        xSemaphoreGive(http_mutex);
+        return ESP_ERR_NO_MEM;
+    }
     if (bearer && bearer[0]) {
         char header[2080];
         snprintf(header, sizeof(header), "Bearer %s", bearer);
@@ -102,10 +115,23 @@ static esp_err_t perform_http(const char *url, esp_http_client_method_t method,
         esp_http_client_set_header(client, "Content-Type", "application/x-www-form-urlencoded");
         esp_http_client_set_post_field(client, body, strlen(body));
     }
-    esp_err_t err = esp_http_client_perform(client);
+    const int64_t deadline_us = esp_timer_get_time() + (int64_t)total_timeout_ms * 1000;
+    esp_err_t err;
+    do {
+        err = esp_http_client_perform(client);
+        if (err != ESP_ERR_HTTP_EAGAIN) break;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    } while (esp_timer_get_time() < deadline_us);
+
+    if (err == ESP_ERR_HTTP_EAGAIN) {
+        ESP_LOGW(TAG, "HTTPS request exceeded %d ms", total_timeout_ms);
+        esp_http_client_close(client);
+        err = ESP_ERR_TIMEOUT;
+    }
     *status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
     if (response->overflow) err = ESP_ERR_NO_MEM;
+    xSemaphoreGive(http_mutex);
     return err;
 }
 
@@ -146,7 +172,7 @@ static esp_err_t refresh_bearer(const radar_config_t *config)
     int status = 0;
     esp_err_t err = perform_http(
         "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token",
-        HTTP_METHOD_POST, body, NULL, &response, &status);
+        HTTP_METHOD_POST, body, NULL, &response, &status, 20000);
     if (err != ESP_OK || status != 200 || !response.data) {
         ESP_LOGW(TAG, "OpenSky OAuth failed: %s, HTTP %d", esp_err_to_name(err), status);
         free(response.data);
@@ -186,6 +212,13 @@ static void copy_json_string(cJSON *array, int index, char *dest, size_t dest_si
     while (length && isspace((unsigned char)dest[length - 1])) dest[--length] = '\0';
 }
 
+static void copy_object_string(cJSON *object, const char *name, char *dest, size_t dest_size)
+{
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(object, name);
+    dest[0] = '\0';
+    if (cJSON_IsString(item)) strlcpy(dest, item->valuestring, dest_size);
+}
+
 esp_err_t radar_network_fetch_aircraft(const radar_config_t *config,
                                        radar_aircraft_list_t *aircraft,
                                        int *http_status)
@@ -199,12 +232,16 @@ esp_err_t radar_network_fetch_aircraft(const radar_config_t *config,
     }
     char url[384];
     snprintf(url, sizeof(url),
-             "https://opensky-network.org/api/states/all?lamin=%.6f&lamax=%.6f&lomin=%.6f&lomax=%.6f",
+             "https://opensky-network.org/api/states/all?lamin=%.6f&lamax=%.6f&lomin=%.6f&lomax=%.6f&extended=1",
              config->latitude - config->radius_deg, config->latitude + config->radius_deg,
              config->longitude - config->radius_deg, config->longitude + config->radius_deg);
 
     response_buffer_t response;
-    esp_err_t err = perform_http(url, HTTP_METHOD_GET, NULL, bearer_token, &response, http_status);
+    ESP_LOGI(TAG, "OpenSky states request started");
+    esp_err_t err = perform_http(url, HTTP_METHOD_GET, NULL, bearer_token, &response,
+                                 http_status, 20000);
+    ESP_LOGI(TAG, "OpenSky states request finished: %s, HTTP %d, %u bytes",
+             esp_err_to_name(err), *http_status, (unsigned)response.length);
     if (err != ESP_OK || *http_status != 200 || !response.data) {
         if (*http_status == 401) {
             bearer_token[0] = '\0';
@@ -231,6 +268,7 @@ esp_err_t radar_network_fetch_aircraft(const radar_config_t *config,
         radar_aircraft_t *item = &aircraft->items[aircraft->count++];
         copy_json_string(entry, 0, item->icao24, sizeof(item->icao24));
         copy_json_string(entry, 1, item->callsign, sizeof(item->callsign));
+        copy_json_string(entry, 2, item->origin_country, sizeof(item->origin_country));
         item->longitude = json_number(entry, 5, 0);
         item->latitude = json_number(entry, 6, 0);
         item->altitude_m = json_number(entry, 7, 0);
@@ -238,10 +276,100 @@ esp_err_t radar_network_fetch_aircraft(const radar_config_t *config,
         item->on_ground = cJSON_IsTrue(ground);
         item->velocity_mps = json_number(entry, 9, 0);
         item->track_deg = json_number(entry, 10, 0);
+        item->vertical_rate_mps = json_number(entry, 11, 0);
+        copy_json_string(entry, 14, item->squawk, sizeof(item->squawk));
+        item->category = (uint8_t)json_number(entry, 17, 0);
         item->received_us = esp_timer_get_time();
     }
     cJSON_Delete(root);
     return ESP_OK;
+}
+
+esp_err_t radar_network_fetch_aircraft_details(const radar_aircraft_t *aircraft,
+                                               radar_aircraft_details_t *details,
+                                               int *http_status)
+{
+    if (!aircraft || !details || !http_status || !aircraft->icao24[0]) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(details, 0, sizeof(*details));
+    strlcpy(details->icao24, aircraft->icao24, sizeof(details->icao24));
+    *http_status = 0;
+    if (!connected) return ESP_ERR_INVALID_STATE;
+
+    char url[256];
+    if (aircraft->callsign[0]) {
+        char encoded_callsign[sizeof(aircraft->callsign) * 3];
+        form_encode(aircraft->callsign, encoded_callsign, sizeof(encoded_callsign));
+        snprintf(url, sizeof(url), "https://api.adsbdb.com/v0/aircraft/%s?callsign=%s",
+                 aircraft->icao24, encoded_callsign);
+    } else {
+        snprintf(url, sizeof(url), "https://api.adsbdb.com/v0/aircraft/%s",
+                 aircraft->icao24);
+    }
+
+    response_buffer_t response;
+    esp_err_t err = perform_http(url, HTTP_METHOD_GET, NULL, NULL, &response, http_status, 8000);
+    if (err != ESP_OK || *http_status != 200 || !response.data) {
+        free(response.data);
+        return err == ESP_OK && *http_status == 404 ? ESP_ERR_NOT_FOUND :
+               err == ESP_OK ? ESP_ERR_INVALID_RESPONSE : err;
+    }
+
+    cJSON *root = cJSON_Parse(response.data);
+    free(response.data);
+    cJSON *payload = root ? cJSON_GetObjectItemCaseSensitive(root, "response") : NULL;
+    cJSON *aircraft_json = cJSON_IsObject(payload)
+                               ? cJSON_GetObjectItemCaseSensitive(payload, "aircraft")
+                               : NULL;
+    cJSON *route = cJSON_IsObject(payload)
+                       ? cJSON_GetObjectItemCaseSensitive(payload, "flightroute")
+                       : NULL;
+
+    if (cJSON_IsObject(aircraft_json)) {
+        details->aircraft_found = true;
+        copy_object_string(aircraft_json, "registration", details->registration,
+                           sizeof(details->registration));
+        copy_object_string(aircraft_json, "type", details->type, sizeof(details->type));
+        copy_object_string(aircraft_json, "icao_type", details->icao_type,
+                           sizeof(details->icao_type));
+        copy_object_string(aircraft_json, "manufacturer", details->manufacturer,
+                           sizeof(details->manufacturer));
+        copy_object_string(aircraft_json, "registered_owner", details->owner,
+                           sizeof(details->owner));
+    }
+
+    if (cJSON_IsObject(route)) {
+        cJSON *airline = cJSON_GetObjectItemCaseSensitive(route, "airline");
+        cJSON *origin = cJSON_GetObjectItemCaseSensitive(route, "origin");
+        cJSON *destination = cJSON_GetObjectItemCaseSensitive(route, "destination");
+        if (cJSON_IsObject(airline)) {
+            copy_object_string(airline, "name", details->airline, sizeof(details->airline));
+        }
+        if (cJSON_IsObject(origin) && cJSON_IsObject(destination)) {
+            details->route_found = true;
+            copy_object_string(origin, "icao_code", details->origin_icao,
+                               sizeof(details->origin_icao));
+            copy_object_string(origin, "iata_code", details->origin_iata,
+                               sizeof(details->origin_iata));
+            copy_object_string(origin, "name", details->origin_name,
+                               sizeof(details->origin_name));
+            copy_object_string(origin, "municipality", details->origin_city,
+                               sizeof(details->origin_city));
+            copy_object_string(destination, "icao_code", details->destination_icao,
+                               sizeof(details->destination_icao));
+            copy_object_string(destination, "iata_code", details->destination_iata,
+                               sizeof(details->destination_iata));
+            copy_object_string(destination, "name", details->destination_name,
+                               sizeof(details->destination_name));
+            copy_object_string(destination, "municipality", details->destination_city,
+                               sizeof(details->destination_city));
+        }
+    }
+
+    const bool found = details->aircraft_found || details->route_found;
+    cJSON_Delete(root);
+    return found ? ESP_OK : ESP_ERR_NOT_FOUND;
 }
 
 static int hex_value(char c)
@@ -439,7 +567,8 @@ esp_err_t radar_network_start(const radar_config_t *config)
 {
     web_config = *config;
     wifi_events = xEventGroupCreate();
-    if (!wifi_events) return ESP_ERR_NO_MEM;
+    http_mutex = xSemaphoreCreateMutex();
+    if (!wifi_events || !http_mutex) return ESP_ERR_NO_MEM;
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();

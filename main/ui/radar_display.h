@@ -8,4 +8,13 @@ void radar_display_update_aircraft(const radar_aircraft_list_t *aircraft);
 void radar_display_set_status(const char *status);
 void radar_display_set_center(double latitude, double longitude, double radius_deg);
 void radar_display_set_options(bool show_sweep, bool show_labels);
-bool radar_display_labels_enabled(void);
+
+/** Cycles the detail card selection. Returns true when detail mode consumed the input. */
+bool radar_display_rotate_selection(int direction);
+
+/** Copies the selected live aircraft for asynchronous metadata lookup. */
+bool radar_display_get_selected_aircraft(radar_aircraft_t *aircraft);
+void radar_display_set_details_loading(const char *icao24);
+void radar_display_set_aircraft_details(const char *icao24,
+                                        const radar_aircraft_details_t *details,
+                                        bool available);

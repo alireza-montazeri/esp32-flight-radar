@@ -12,3 +12,6 @@ bool radar_network_is_authenticated(void);
 esp_err_t radar_network_fetch_aircraft(const radar_config_t *config,
                                        radar_aircraft_list_t *aircraft,
                                        int *http_status);
+esp_err_t radar_network_fetch_aircraft_details(const radar_aircraft_t *aircraft,
+                                               radar_aircraft_details_t *details,
+                                               int *http_status);
