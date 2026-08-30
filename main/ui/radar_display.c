@@ -14,20 +14,29 @@
 #include "user_config.h"
 #include "waveshare_display_port.h"
 
-#define RADAR_SIZE       360
-#define RADAR_CENTER     180
-#define RADAR_RADIUS_PX  166
-#define DEG_TO_RAD       0.01745329251994329577
+#define RADAR_SIZE 360
+#define RADAR_CENTER 180
+#define RADAR_RADIUS_PX 166
+#define DEG_TO_RAD 0.01745329251994329577
 #define AIRCRAFT_HIT_RADIUS_PX 28
+#define AIRCRAFT_ICON_SIZE 18
+#define AIRCRAFT_ICON_DIRECTIONS 16
+#define SWEEP_BEAM_RAYS 10
+#define SWEEP_BEAM_WIDTH_DEG 10.0
+#define SWEEP_ROTATION_PERIOD_US 15000000.0
+#define RADAR_FRAME_PERIOD_MS 50
+#define KILOMETRES_PER_DEGREE 111.32
 
-typedef enum {
+typedef enum
+{
     DETAILS_NOT_REQUESTED,
     DETAILS_LOADING,
     DETAILS_READY,
     DETAILS_UNAVAILABLE,
 } details_state_t;
 
-typedef struct {
+typedef struct
+{
     radar_aircraft_list_t aircraft;
     char status[64];
     double latitude;
@@ -35,6 +44,7 @@ typedef struct {
     double radius_deg;
     bool show_sweep;
     bool show_labels;
+    bool wifi_connected;
     bool detail_active;
     char selected_icao24[7];
     details_state_t details_state;
@@ -44,8 +54,14 @@ typedef struct {
 static const char *DISPLAY_TAG = "radar_display";
 static SemaphoreHandle_t state_mutex;
 static display_state_t state;
+static radar_aircraft_list_t pending_aircraft;
+static double previous_sweep_angle;
+static bool sweep_angle_initialized;
 static lv_obj_t *canvas;
 static lv_color_t *canvas_buffer;
+static lv_img_dsc_t aircraft_icon_images[AIRCRAFT_ICON_DIRECTIONS];
+static void *aircraft_icon_buffers[AIRCRAFT_ICON_DIRECTIONS];
+static bool aircraft_icons_ready;
 
 static void clear_details_locked(void)
 {
@@ -57,12 +73,15 @@ static void predicted_position(const radar_aircraft_t *aircraft, double *latitud
                                double *longitude)
 {
     double elapsed_s = (esp_timer_get_time() - aircraft->received_us) / 1000000.0;
-    if (elapsed_s < 0) elapsed_s = 0;
-    if (elapsed_s > 300) elapsed_s = 300;
+    if (elapsed_s < 0)
+        elapsed_s = 0;
+    if (elapsed_s > 300)
+        elapsed_s = 300;
 
     *latitude = aircraft->latitude;
     *longitude = aircraft->longitude;
-    if (aircraft->on_ground) return;
+    if (aircraft->on_ground)
+        return;
 
     const double heading = aircraft->track_deg * DEG_TO_RAD;
     const double metres_per_degree = 111320.0;
@@ -75,13 +94,10 @@ static void predicted_position(const radar_aircraft_t *aircraft, double *latitud
 static bool aircraft_screen_position(const radar_aircraft_t *aircraft,
                                      const display_state_t *snapshot, int *x, int *y)
 {
-    double predicted_lat;
-    double predicted_lon;
-    predicted_position(aircraft, &predicted_lat, &predicted_lon);
-
-    const double x_norm = (predicted_lon - snapshot->longitude) *
+    const double x_norm = (aircraft->longitude - snapshot->longitude) *
                           cos(snapshot->latitude * DEG_TO_RAD) / snapshot->radius_deg;
-    const double y_norm = (predicted_lat - snapshot->latitude) / snapshot->radius_deg;
+    const double y_norm = (aircraft->latitude - snapshot->latitude) /
+                          snapshot->radius_deg;
     *x = RADAR_CENTER + (int)lround(x_norm * RADAR_RADIUS_PX);
     *y = RADAR_CENTER - (int)lround(y_norm * RADAR_RADIUS_PX);
 
@@ -91,18 +107,144 @@ static bool aircraft_screen_position(const radar_aircraft_t *aircraft,
     return dx * dx + dy * dy <= visible_radius * visible_radius;
 }
 
+static double aircraft_bearing(double latitude, double longitude,
+                               const display_state_t *snapshot)
+{
+    const double north = latitude - snapshot->latitude;
+    const double east = (longitude - snapshot->longitude) *
+                        cos(snapshot->latitude * DEG_TO_RAD);
+    double bearing = atan2(east, north);
+    if (bearing < 0)
+        bearing += 2.0 * M_PI;
+    return bearing;
+}
+
+static bool sweep_crossed_angle(double previous, double current, double target)
+{
+    if (current >= previous)
+        return target > previous && target <= current;
+    return target > previous || target <= current;
+}
+
+static bool pending_contains_aircraft(const char *icao24)
+{
+    for (size_t i = 0; i < pending_aircraft.count; ++i)
+    {
+        if (strcmp(pending_aircraft.items[i].icao24, icao24) == 0)
+            return true;
+    }
+    return false;
+}
+
+static void ensure_selected_aircraft_locked(void)
+{
+    if (!state.detail_active)
+        return;
+
+    bool selected_is_visible = false;
+    int first_visible = -1;
+    for (size_t i = 0; i < state.aircraft.count; ++i)
+    {
+        int x;
+        int y;
+        if (!aircraft_screen_position(&state.aircraft.items[i], &state, &x, &y))
+            continue;
+        if (first_visible < 0)
+            first_visible = (int)i;
+        if (strcmp(state.selected_icao24, state.aircraft.items[i].icao24) == 0)
+        {
+            selected_is_visible = true;
+        }
+    }
+
+    if (!selected_is_visible && first_visible >= 0)
+    {
+        strlcpy(state.selected_icao24, state.aircraft.items[first_visible].icao24,
+                sizeof(state.selected_icao24));
+        clear_details_locked();
+    }
+    else if (!selected_is_visible)
+    {
+        state.detail_active = false;
+        state.selected_icao24[0] = '\0';
+        clear_details_locked();
+    }
+}
+
+static void update_aircraft_at_sweep_locked(double sweep_angle)
+{
+    if (!sweep_angle_initialized)
+    {
+        previous_sweep_angle = sweep_angle;
+        sweep_angle_initialized = true;
+        return;
+    }
+
+    for (size_t i = 0; i < pending_aircraft.count; ++i)
+    {
+        double latitude;
+        double longitude;
+        predicted_position(&pending_aircraft.items[i], &latitude, &longitude);
+        const double bearing = aircraft_bearing(latitude, longitude, &state);
+        if (!sweep_crossed_angle(previous_sweep_angle, sweep_angle, bearing))
+            continue;
+
+        radar_aircraft_t scanned = pending_aircraft.items[i];
+        scanned.latitude = latitude;
+        scanned.longitude = longitude;
+        scanned.received_us = esp_timer_get_time();
+
+        size_t displayed = 0;
+        while (displayed < state.aircraft.count &&
+               strcmp(state.aircraft.items[displayed].icao24, scanned.icao24) != 0)
+        {
+            ++displayed;
+        }
+        if (displayed < state.aircraft.count)
+        {
+            state.aircraft.items[displayed] = scanned;
+        }
+        else if (state.aircraft.count < RADAR_MAX_AIRCRAFT)
+        {
+            state.aircraft.items[state.aircraft.count++] = scanned;
+        }
+    }
+
+    for (size_t i = 0; i < state.aircraft.count;)
+    {
+        radar_aircraft_t *displayed = &state.aircraft.items[i];
+        const double bearing = aircraft_bearing(displayed->latitude,
+                                                displayed->longitude, &state);
+        if (!pending_contains_aircraft(displayed->icao24) &&
+            sweep_crossed_angle(previous_sweep_angle, sweep_angle, bearing))
+        {
+            memmove(displayed, displayed + 1,
+                    (state.aircraft.count - i - 1) * sizeof(*displayed));
+            --state.aircraft.count;
+            continue;
+        }
+        ++i;
+    }
+
+    previous_sweep_angle = sweep_angle;
+    ensure_selected_aircraft_locked();
+}
+
 static int find_nearest_aircraft(const display_state_t *snapshot, int tap_x, int tap_y)
 {
     int nearest = -1;
     int nearest_distance_sq = AIRCRAFT_HIT_RADIUS_PX * AIRCRAFT_HIT_RADIUS_PX + 1;
-    for (size_t i = 0; i < snapshot->aircraft.count; ++i) {
+    for (size_t i = 0; i < snapshot->aircraft.count; ++i)
+    {
         int x;
         int y;
-        if (!aircraft_screen_position(&snapshot->aircraft.items[i], snapshot, &x, &y)) continue;
+        if (!aircraft_screen_position(&snapshot->aircraft.items[i], snapshot, &x, &y))
+            continue;
         const int dx = tap_x - x;
         const int dy = tap_y - y;
         const int distance_sq = dx * dx + dy * dy;
-        if (distance_sq < nearest_distance_sq) {
+        if (distance_sq < nearest_distance_sq)
+        {
             nearest = (int)i;
             nearest_distance_sq = distance_sq;
         }
@@ -113,21 +255,26 @@ static int find_nearest_aircraft(const display_state_t *snapshot, int tap_x, int
 static void canvas_clicked(lv_event_t *event)
 {
     lv_indev_t *indev = lv_event_get_indev(event);
-    if (!indev) return;
+    if (!indev)
+        return;
     lv_point_t point;
     lv_area_t canvas_area;
     lv_indev_get_point(indev, &point);
     lv_obj_get_coords(canvas, &canvas_area);
 
     xSemaphoreTake(state_mutex, portMAX_DELAY);
-    if (state.detail_active) {
+    if (state.detail_active)
+    {
         state.detail_active = false;
         state.selected_icao24[0] = '\0';
         clear_details_locked();
-    } else {
+    }
+    else
+    {
         const int selected = find_nearest_aircraft(
             &state, point.x - canvas_area.x1, point.y - canvas_area.y1);
-        if (selected >= 0) {
+        if (selected >= 0)
+        {
             state.detail_active = true;
             strlcpy(state.selected_icao24, state.aircraft.items[selected].icao24,
                     sizeof(state.selected_icao24));
@@ -183,39 +330,119 @@ static bool text_fits_detail_row(const char *text, int width)
                             LV_TEXT_FLAG_EXPAND) <= width;
 }
 
-static void draw_aircraft_count(int icon_x, int icon_y, size_t count, lv_color_t color)
+static void init_rotated_aircraft_icons(void)
 {
-    draw_line(icon_x, icon_y - 6, icon_x, icon_y + 6, color, 2, LV_OPA_COVER);
-    draw_line(icon_x - 6, icon_y, icon_x, icon_y - 2, color, 2, LV_OPA_COVER);
-    draw_line(icon_x, icon_y - 2, icon_x + 6, icon_y, color, 2, LV_OPA_COVER);
-    draw_line(icon_x - 3, icon_y + 5, icon_x, icon_y + 3, color, 1, LV_OPA_COVER);
-    draw_line(icon_x, icon_y + 3, icon_x + 3, icon_y + 5, color, 1, LV_OPA_COVER);
+    const size_t buffer_size = LV_CANVAS_BUF_SIZE_TRUE_COLOR_ALPHA(
+        AIRCRAFT_ICON_SIZE, AIRCRAFT_ICON_SIZE);
+    void *source_buffer = heap_caps_calloc(1, buffer_size,
+                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!source_buffer)
+        source_buffer = heap_caps_calloc(1, buffer_size, MALLOC_CAP_8BIT);
+    if (!source_buffer)
+        return;
 
-    char count_text[8];
-    snprintf(count_text, sizeof(count_text), "%u", (unsigned)count);
-    draw_text(icon_x + 9, icon_y - 7, 30, count_text, color, LV_TEXT_ALIGN_LEFT);
+    lv_obj_t *source_canvas = lv_canvas_create(lv_scr_act());
+    lv_obj_t *rotation_canvas = lv_canvas_create(lv_scr_act());
+    lv_canvas_set_buffer(source_canvas, source_buffer, AIRCRAFT_ICON_SIZE,
+                         AIRCRAFT_ICON_SIZE, LV_IMG_CF_TRUE_COLOR_ALPHA);
+    lv_canvas_fill_bg(source_canvas, lv_color_white(), LV_OPA_TRANSP);
+
+    lv_draw_label_dsc_t label_dsc;
+    lv_draw_label_dsc_init(&label_dsc);
+    label_dsc.color = lv_color_white();
+    label_dsc.font = &lv_font_montserrat_12;
+    label_dsc.align = LV_TEXT_ALIGN_CENTER;
+    label_dsc.flag |= LV_TEXT_FLAG_EXPAND;
+    lv_canvas_draw_text(source_canvas, 2, 2, AIRCRAFT_ICON_SIZE - 4,
+                        &label_dsc, LV_SYMBOL_GPS);
+
+    const lv_img_dsc_t source_image = *lv_canvas_get_img(source_canvas);
+    for (size_t i = 0; i < AIRCRAFT_ICON_DIRECTIONS; ++i)
+    {
+        aircraft_icon_buffers[i] = heap_caps_calloc(
+            1, buffer_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!aircraft_icon_buffers[i])
+        {
+            aircraft_icon_buffers[i] = heap_caps_calloc(1, buffer_size, MALLOC_CAP_8BIT);
+        }
+        if (!aircraft_icon_buffers[i])
+            break;
+
+        lv_canvas_set_buffer(rotation_canvas, aircraft_icon_buffers[i],
+                             AIRCRAFT_ICON_SIZE, AIRCRAFT_ICON_SIZE,
+                             LV_IMG_CF_TRUE_COLOR_ALPHA);
+        lv_canvas_fill_bg(rotation_canvas, lv_color_white(), LV_OPA_TRANSP);
+
+        /* Font Awesome's location arrow points north-east. Rotate direction 0 north. */
+        const int16_t angle = (3150 + (int16_t)i *
+                                          (3600 / AIRCRAFT_ICON_DIRECTIONS)) %
+                              3600;
+        lv_canvas_transform(rotation_canvas, (lv_img_dsc_t *)&source_image, angle,
+                            LV_IMG_ZOOM_NONE, 0, 0,
+                            AIRCRAFT_ICON_SIZE / 2, AIRCRAFT_ICON_SIZE / 2, true);
+        aircraft_icon_images[i] = *lv_canvas_get_img(rotation_canvas);
+    }
+
+    aircraft_icons_ready = true;
+    for (size_t i = 0; i < AIRCRAFT_ICON_DIRECTIONS; ++i)
+    {
+        if (!aircraft_icon_buffers[i])
+        {
+            aircraft_icons_ready = false;
+            break;
+        }
+    }
+    lv_obj_del(rotation_canvas);
+    lv_obj_del(source_canvas);
+    heap_caps_free(source_buffer);
+
+    if (!aircraft_icons_ready)
+    {
+        for (size_t i = 0; i < AIRCRAFT_ICON_DIRECTIONS; ++i)
+        {
+            heap_caps_free(aircraft_icon_buffers[i]);
+            aircraft_icon_buffers[i] = NULL;
+        }
+        ESP_LOGW(DISPLAY_TAG, "Rotated GPS icons unavailable; using upright symbols");
+    }
+}
+
+static void draw_aircraft_symbol(int center_x, int center_y, double heading_deg,
+                                 lv_color_t color)
+{
+    if (!aircraft_icons_ready)
+    {
+        draw_text_single_line(center_x - 7, center_y - 7, 14, LV_SYMBOL_GPS,
+                              color, LV_TEXT_ALIGN_CENTER);
+        return;
+    }
+
+    const double normalized = fmod(heading_deg + 360.0, 360.0);
+    const size_t direction = (size_t)lround(
+                                 normalized * AIRCRAFT_ICON_DIRECTIONS / 360.0) %
+                             AIRCRAFT_ICON_DIRECTIONS;
+    lv_draw_img_dsc_t image_dsc;
+    lv_draw_img_dsc_init(&image_dsc);
+    image_dsc.recolor = color;
+    image_dsc.recolor_opa = LV_OPA_COVER;
+    lv_canvas_draw_img(canvas, center_x - AIRCRAFT_ICON_SIZE / 2,
+                       center_y - AIRCRAFT_ICON_SIZE / 2,
+                       &aircraft_icon_images[direction], &image_dsc);
 }
 
 static void draw_aircraft(const radar_aircraft_t *aircraft, const display_state_t *snapshot,
                           bool selected)
 {
-    const double heading = aircraft->track_deg * DEG_TO_RAD;
     int x;
     int y;
-    if (!aircraft_screen_position(aircraft, snapshot, &x, &y)) return;
+    if (!aircraft_screen_position(aircraft, snapshot, &x, &y))
+        return;
 
-    const int nose_x = x + (int)lround(sin(heading) * 7.0);
-    const int nose_y = y - (int)lround(cos(heading) * 7.0);
-    const int left_x = x + (int)lround(sin(heading + 2.45) * 5.0);
-    const int left_y = y - (int)lround(cos(heading + 2.45) * 5.0);
-    const int right_x = x + (int)lround(sin(heading - 2.45) * 5.0);
-    const int right_y = y - (int)lround(cos(heading - 2.45) * 5.0);
     const lv_color_t bright = aircraft->on_ground ? lv_palette_main(LV_PALETTE_AMBER) : lv_color_hex(0x00ff55);
-    draw_line(nose_x, nose_y, left_x, left_y, bright, 2, LV_OPA_COVER);
-    draw_line(left_x, left_y, right_x, right_y, bright, 2, LV_OPA_COVER);
-    draw_line(right_x, right_y, nose_x, nose_y, bright, 2, LV_OPA_COVER);
+    draw_aircraft_symbol(x, y, aircraft->track_deg, bright);
 
-    if (selected) {
+    if (selected)
+    {
         lv_draw_arc_dsc_t selection;
         lv_draw_arc_dsc_init(&selection);
         selection.color = lv_color_white();
@@ -224,12 +451,37 @@ static void draw_aircraft(const radar_aircraft_t *aircraft, const display_state_
         lv_canvas_draw_arc(canvas, x, y, 12, 0, 360, &selection);
     }
 
-    if (snapshot->show_labels) {
+    if (snapshot->show_labels)
+    {
         char label[28];
         const char *name = aircraft->callsign[0] ? aircraft->callsign : aircraft->icao24;
-        snprintf(label, sizeof(label), "%s %.0fft", name, aircraft->altitude_m * 3.28084f);
+        snprintf(label, sizeof(label), "%s", name);
         draw_text(x + 8, y - 7, 112, label, lv_color_hex(0x7dff9d), LV_TEXT_ALIGN_LEFT);
     }
+}
+
+static void draw_sweep_beam(double leading_angle, lv_color_t color)
+{
+    const double beam_width = SWEEP_BEAM_WIDTH_DEG * DEG_TO_RAD;
+    for (int ray = 0; ray < SWEEP_BEAM_RAYS; ++ray)
+    {
+        const double progress = (ray + 1.0) / SWEEP_BEAM_RAYS;
+        const double angle = leading_angle - beam_width * (1.0 - progress);
+        const int end_x = RADAR_CENTER +
+                          (int)lround(sin(angle) * (RADAR_RADIUS_PX - 2));
+        const int end_y = RADAR_CENTER -
+                          (int)lround(cos(angle) * (RADAR_RADIUS_PX - 2));
+        const lv_opa_t opacity = (lv_opa_t)lround(5.0 + progress * progress * 95.0);
+        draw_line(RADAR_CENTER, RADAR_CENTER, end_x, end_y,
+                  color, 5, opacity);
+    }
+
+    const int leading_x = RADAR_CENTER +
+                          (int)lround(sin(leading_angle) * (RADAR_RADIUS_PX - 2));
+    const int leading_y = RADAR_CENTER -
+                          (int)lround(cos(leading_angle) * (RADAR_RADIUS_PX - 2));
+    draw_line(RADAR_CENTER, RADAR_CENTER, leading_x, leading_y,
+              color, 2, LV_OPA_70);
 }
 
 static int selected_aircraft_index(const display_state_t *snapshot,
@@ -240,15 +492,18 @@ static int selected_aircraft_index(const display_state_t *snapshot,
     *visible_position = 0;
     *visible_count = 0;
 
-    for (size_t i = 0; i < snapshot->aircraft.count; ++i) {
+    for (size_t i = 0; i < snapshot->aircraft.count; ++i)
+    {
         int x;
         int y;
-        if (!aircraft_screen_position(&snapshot->aircraft.items[i], snapshot, &x, &y)) {
+        if (!aircraft_screen_position(&snapshot->aircraft.items[i], snapshot, &x, &y))
+        {
             continue;
         }
 
         ++(*visible_count);
-        if (strcmp(snapshot->selected_icao24, snapshot->aircraft.items[i].icao24) == 0) {
+        if (strcmp(snapshot->selected_icao24, snapshot->aircraft.items[i].icao24) == 0)
+        {
             selected = (int)i;
             *visible_position = *visible_count;
         }
@@ -258,8 +513,10 @@ static int selected_aircraft_index(const display_state_t *snapshot,
 
 static const char *airport_code(const char *iata, const char *icao)
 {
-    if (iata[0]) return iata;
-    if (icao[0]) return icao;
+    if (iata[0])
+        return iata;
+    if (icao[0])
+        return icao;
     return "---";
 }
 
@@ -274,7 +531,8 @@ static void draw_detail_card(const display_state_t *snapshot)
     size_t visible_position;
     size_t visible_count;
     const int selected = selected_aircraft_index(snapshot, &visible_position, &visible_count);
-    if (selected < 0) return;
+    if (selected < 0)
+        return;
 
     const radar_aircraft_t *aircraft = &snapshot->aircraft.items[selected];
     const lv_color_t green = lv_color_hex(0x39ff75);
@@ -304,7 +562,7 @@ static void draw_detail_card(const display_state_t *snapshot)
     lv_draw_rect_dsc_t card;
     lv_draw_rect_dsc_init(&card);
     card.bg_color = lv_color_hex(0x021408);
-    card.bg_opa = LV_OPA_70;
+    card.bg_opa = (lv_opa_t)217; /* 85% opaque: solid enough to read, still translucent. */
     card.border_color = green;
     card.border_width = 2;
     card.radius = 10;
@@ -323,29 +581,36 @@ static void draw_detail_card(const display_state_t *snapshot)
               green, 1, LV_OPA_60);
 
     int row_y = card_y + 41;
-    if (loading) {
+    if (loading)
+    {
         draw_text(text_x, row_y, text_width, LV_SYMBOL_REFRESH " Details...",
                   dim_green, LV_TEXT_ALIGN_LEFT);
         row_y += 20;
     }
-    if (show_company) {
+    if (show_company)
+    {
         snprintf(line, sizeof(line), LV_SYMBOL_HOME " %.24s", company);
         draw_text(text_x, row_y, text_width, line, dim_green, LV_TEXT_ALIGN_LEFT);
         row_y += 20;
     }
-    if (show_aircraft_type) {
+    if (show_aircraft_type)
+    {
         const char *aircraft_type = details->type[0] ? details->type : details->icao_type;
-        if (details->manufacturer[0] && aircraft_type[0]) {
+        if (details->manufacturer[0] && aircraft_type[0])
+        {
             snprintf(line, sizeof(line), LV_SYMBOL_FILE " %.16s %.18s",
                      details->manufacturer, aircraft_type);
-        } else {
+        }
+        else
+        {
             snprintf(line, sizeof(line), LV_SYMBOL_FILE " %.28s",
                      details->manufacturer[0] ? details->manufacturer : aircraft_type);
         }
         draw_text(text_x, row_y, text_width, line, dim_green, LV_TEXT_ALIGN_LEFT);
         row_y += 20;
     }
-    if (show_route) {
+    if (show_route)
+    {
         const char *origin_location = details->origin_city[0]
                                           ? details->origin_city
                                           : details->origin_name;
@@ -358,11 +623,13 @@ static void draw_detail_card(const display_state_t *snapshot)
                                                     details->destination_icao);
         snprintf(line, sizeof(line), "%s %s " LV_SYMBOL_RIGHT " %s %s",
                  origin_code, origin_location, destination_code, destination_location);
-        if (!text_fits_detail_row(line, text_width)) {
+        if (!text_fits_detail_row(line, text_width))
+        {
             snprintf(line, sizeof(line), "%s %.8s " LV_SYMBOL_RIGHT " %s %.8s",
                      origin_code, origin_location, destination_code, destination_location);
         }
-        if (!text_fits_detail_row(line, text_width)) {
+        if (!text_fits_detail_row(line, text_width))
+        {
             snprintf(line, sizeof(line), "%s " LV_SYMBOL_RIGHT " %s",
                      origin_code, destination_code);
         }
@@ -370,22 +637,21 @@ static void draw_detail_card(const display_state_t *snapshot)
                               LV_TEXT_ALIGN_LEFT);
         row_y += 20;
     }
-    if (no_additional_details) {
+    if (no_additional_details)
+    {
         draw_text(text_x, row_y, text_width,
                   LV_SYMBOL_WARNING " No additional detail found",
                   dim_green, LV_TEXT_ALIGN_LEFT);
         row_y += 20;
     }
 
-    const float altitude_ft = aircraft->altitude_m * 3.28084f;
-    const float vertical_speed_fpm = aircraft->vertical_rate_mps * 196.8504f;
-    const float speed_knots = aircraft->velocity_mps * 1.94384f;
-    snprintf(line, sizeof(line), LV_SYMBOL_UPLOAD " %.0f ft    %+.0f fpm",
-             altitude_ft, vertical_speed_fpm);
+    snprintf(line, sizeof(line), LV_SYMBOL_UPLOAD " %.0f m    %+.1f m/s",
+             aircraft->altitude_m, aircraft->vertical_rate_mps);
     draw_text(text_x, row_y, text_width, line, green, LV_TEXT_ALIGN_LEFT);
     row_y += 20;
 
-    snprintf(line, sizeof(line), LV_SYMBOL_CHARGE " %.0f kt", speed_knots);
+    snprintf(line, sizeof(line), LV_SYMBOL_CHARGE " %.1f m/s",
+             aircraft->velocity_mps);
     draw_text(text_x, row_y, text_width, line, green, LV_TEXT_ALIGN_LEFT);
     row_y += 20;
 
@@ -395,7 +661,7 @@ static void draw_detail_card(const display_state_t *snapshot)
     draw_text(text_x, row_y, text_width, line, green, LV_TEXT_ALIGN_LEFT);
 }
 
-static void render_frame(const display_state_t *snapshot)
+static void render_frame(const display_state_t *snapshot, double sweep_angle)
 {
     const lv_color_t green = lv_color_hex(0x00d040);
     const lv_color_t dim_green = lv_color_hex(0x006822);
@@ -412,67 +678,95 @@ static void render_frame(const display_state_t *snapshot)
     draw_line(14, RADAR_CENTER, 346, RADAR_CENTER, dim_green, 1, LV_OPA_60);
     draw_line(RADAR_CENTER, 14, RADAR_CENTER, 346, dim_green, 1, LV_OPA_60);
 
-    if (snapshot->show_sweep) {
-        const double angle = fmod(esp_timer_get_time() / 3000000.0, 2.0 * M_PI);
-        const int sx = RADAR_CENTER + (int)lround(sin(angle) * RADAR_RADIUS_PX);
-        const int sy = RADAR_CENTER - (int)lround(cos(angle) * RADAR_RADIUS_PX);
-        draw_line(RADAR_CENTER, RADAR_CENTER, sx, sy, green, 2, LV_OPA_70);
-    }
-
-    for (size_t i = 0; i < snapshot->aircraft.count; ++i) {
+    for (size_t i = 0; i < snapshot->aircraft.count; ++i)
+    {
         const bool selected = snapshot->detail_active &&
                               strcmp(snapshot->selected_icao24,
                                      snapshot->aircraft.items[i].icao24) == 0;
         draw_aircraft(&snapshot->aircraft.items[i], snapshot, selected);
     }
 
+    if (snapshot->show_sweep)
+    {
+        draw_sweep_beam(sweep_angle, green);
+    }
+
     draw_line(RADAR_CENTER - 2, RADAR_CENTER, RADAR_CENTER + 2, RADAR_CENTER, green, 2, LV_OPA_COVER);
     draw_line(RADAR_CENTER, RADAR_CENTER - 2, RADAR_CENTER, RADAR_CENTER + 2, green, 2, LV_OPA_COVER);
-    char top_scale[48];
-    snprintf(top_scale, sizeof(top_scale), LV_SYMBOL_GPS " %.2f deg",
-             snapshot->radius_deg);
-    draw_text(125, 8, 110, top_scale, green, LV_TEXT_ALIGN_CENTER);
-
-    char bottom_status[96];
+    char top_status[96];
     const bool live = strcmp(snapshot->status, "Live") == 0;
     const bool fetching = strcmp(snapshot->status, "Fetching") == 0;
-    if (live) {
-        strlcpy(bottom_status, LV_SYMBOL_WIFI, sizeof(bottom_status));
-    } else if (fetching) {
-        strlcpy(bottom_status, LV_SYMBOL_REFRESH " Fetching", sizeof(bottom_status));
-    } else {
-        strlcpy(bottom_status, snapshot->status, sizeof(bottom_status));
+    const bool aircraft_fetch_error =
+        strncmp(snapshot->status, "OpenSky error", strlen("OpenSky error")) == 0;
+    const bool fully_live = live && snapshot->wifi_connected;
+    if (fully_live)
+    {
+        snprintf(top_status, sizeof(top_status), LV_SYMBOL_WIFI "  " LV_SYMBOL_GPS " %u",
+                 (unsigned)snapshot->aircraft.count);
+        draw_text_single_line(110, 12, 140, top_status, green, LV_TEXT_ALIGN_CENTER);
     }
-    if (live) {
-        draw_text(137, 338, 34, bottom_status, green, LV_TEXT_ALIGN_CENTER);
-        draw_aircraft_count(195, 345, snapshot->aircraft.count, green);
-    } else if (fetching) {
-        draw_text(120, 338, 78, bottom_status, green, LV_TEXT_ALIGN_LEFT);
-        draw_aircraft_count(211, 345, snapshot->aircraft.count, green);
-    } else {
-        draw_text(80, 319, 160, bottom_status, green, LV_TEXT_ALIGN_CENTER);
-        draw_aircraft_count(255, 326, snapshot->aircraft.count, green);
+    else if (aircraft_fetch_error && snapshot->wifi_connected)
+    {
+        snprintf(top_status, sizeof(top_status),
+                 LV_SYMBOL_WIFI "  " LV_SYMBOL_WARNING "  " LV_SYMBOL_GPS " %u",
+                 (unsigned)snapshot->aircraft.count);
+        draw_text_single_line(95, 12, 170, top_status,
+                              lv_palette_main(LV_PALETTE_AMBER), LV_TEXT_ALIGN_CENTER);
     }
-    if (snapshot->detail_active) draw_detail_card(snapshot);
+    else if (fetching)
+    {
+        strlcpy(top_status, snapshot->wifi_connected ? LV_SYMBOL_WIFI "  " LV_SYMBOL_REFRESH " Fetching..." : LV_SYMBOL_REFRESH " Fetching...",
+                sizeof(top_status));
+        draw_text_single_line(80, 12, 200, top_status, green, LV_TEXT_ALIGN_CENTER);
+    }
+    else
+    {
+        if (snapshot->wifi_connected)
+        {
+            snprintf(top_status, sizeof(top_status), LV_SYMBOL_WIFI "  %s",
+                     snapshot->status);
+        }
+        else
+        {
+            strlcpy(top_status, snapshot->status, sizeof(top_status));
+        }
+        draw_text(90, 18, 180, top_status, green, LV_TEXT_ALIGN_CENTER);
+    }
+
+    char bottom_scale[32];
+    snprintf(bottom_scale, sizeof(bottom_scale), LV_SYMBOL_BARS " %.0f km",
+             snapshot->radius_deg * KILOMETRES_PER_DEGREE);
+    draw_text(125, 338, 110, bottom_scale, green, LV_TEXT_ALIGN_CENTER);
+
+    if (snapshot->detail_active)
+        draw_detail_card(snapshot);
 }
 
 static void render_task(void *arg)
 {
     (void)arg;
     display_state_t *snapshot = heap_caps_malloc(sizeof(*snapshot),
-                                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!snapshot) snapshot = malloc(sizeof(*snapshot));
+                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!snapshot)
+        snapshot = malloc(sizeof(*snapshot));
     assert(snapshot);
 
-    while (true) {
+    while (true)
+    {
+        const double sweep_angle = fmod(
+            (double)esp_timer_get_time() * 2.0 * M_PI / SWEEP_ROTATION_PERIOD_US,
+            2.0 * M_PI);
         xSemaphoreTake(state_mutex, portMAX_DELAY);
+        if (state.show_sweep)
+            update_aircraft_at_sweep_locked(sweep_angle);
         *snapshot = state;
         xSemaphoreGive(state_mutex);
-        if (waveshare_display_lock(1000)) {
-            render_frame(snapshot);
+        if (waveshare_display_lock(1000))
+        {
+            render_frame(snapshot, sweep_angle);
             waveshare_display_unlock();
         }
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(RADAR_FRAME_PERIOD_MS));
     }
 }
 
@@ -485,26 +779,33 @@ void radar_display_init(void)
     state.radius_deg = 0.75;
     state.show_sweep = true;
     state.show_labels = true;
+    state.wifi_connected = false;
     state.detail_active = false;
     state.selected_icao24[0] = '\0';
+    memset(&pending_aircraft, 0, sizeof(pending_aircraft));
+    previous_sweep_angle = 0.0;
+    sweep_angle_initialized = false;
     clear_details_locked();
     strlcpy(state.status, "Flight Radar starting", sizeof(state.status));
 
     waveshare_display_port_init();
     canvas_buffer = heap_caps_malloc(LV_CANVAS_BUF_SIZE_TRUE_COLOR(RADAR_SIZE, RADAR_SIZE),
                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!canvas_buffer) {
+    if (!canvas_buffer)
+    {
         canvas_buffer = heap_caps_malloc(LV_CANVAS_BUF_SIZE_TRUE_COLOR(RADAR_SIZE, RADAR_SIZE),
                                          MALLOC_CAP_8BIT);
     }
     assert(canvas_buffer);
 
-    if (waveshare_display_lock(-1)) {
+    if (waveshare_display_lock(-1))
+    {
         lv_obj_clean(lv_scr_act());
         lv_obj_set_style_bg_color(lv_scr_act(), lv_color_black(), 0);
         canvas = lv_canvas_create(lv_scr_act());
         lv_canvas_set_buffer(canvas, canvas_buffer, RADAR_SIZE, RADAR_SIZE, LV_IMG_CF_TRUE_COLOR);
         lv_obj_center(canvas);
+        init_rotated_aircraft_icons();
         lv_obj_add_flag(canvas, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(canvas, canvas_clicked, LV_EVENT_CLICKED, NULL);
         waveshare_display_unlock();
@@ -516,28 +817,11 @@ void radar_display_init(void)
 void radar_display_update_aircraft(const radar_aircraft_list_t *aircraft)
 {
     xSemaphoreTake(state_mutex, portMAX_DELAY);
-    state.aircraft = *aircraft;
-    if (state.detail_active) {
-        bool selected_is_visible = false;
-        int first_visible = -1;
-        for (size_t i = 0; i < state.aircraft.count; ++i) {
-            int x;
-            int y;
-            if (!aircraft_screen_position(&state.aircraft.items[i], &state, &x, &y)) continue;
-            if (first_visible < 0) first_visible = (int)i;
-            if (strcmp(state.selected_icao24, state.aircraft.items[i].icao24) == 0) {
-                selected_is_visible = true;
-            }
-        }
-        if (!selected_is_visible && first_visible >= 0) {
-            strlcpy(state.selected_icao24, state.aircraft.items[first_visible].icao24,
-                    sizeof(state.selected_icao24));
-            clear_details_locked();
-        } else if (!selected_is_visible) {
-            state.detail_active = false;
-            state.selected_icao24[0] = '\0';
-            clear_details_locked();
-        }
+    pending_aircraft = *aircraft;
+    if (!state.show_sweep)
+    {
+        state.aircraft = pending_aircraft;
+        ensure_selected_aircraft_locked();
     }
     xSemaphoreGive(state_mutex);
 }
@@ -546,6 +830,13 @@ void radar_display_set_status(const char *status)
 {
     xSemaphoreTake(state_mutex, portMAX_DELAY);
     strlcpy(state.status, status, sizeof(state.status));
+    xSemaphoreGive(state_mutex);
+}
+
+void radar_display_set_wifi_connected(bool connected)
+{
+    xSemaphoreTake(state_mutex, portMAX_DELAY);
+    state.wifi_connected = connected;
     xSemaphoreGive(state_mutex);
 }
 
@@ -561,6 +852,15 @@ void radar_display_set_center(double latitude, double longitude, double radius_d
 void radar_display_set_options(bool show_sweep, bool show_labels)
 {
     xSemaphoreTake(state_mutex, portMAX_DELAY);
+    if (state.show_sweep != show_sweep)
+    {
+        sweep_angle_initialized = false;
+        if (!show_sweep)
+        {
+            state.aircraft = pending_aircraft;
+            ensure_selected_aircraft_locked();
+        }
+    }
     state.show_sweep = show_sweep;
     state.show_labels = show_labels;
     xSemaphoreGive(state_mutex);
@@ -570,37 +870,49 @@ bool radar_display_rotate_selection(int direction)
 {
     xSemaphoreTake(state_mutex, portMAX_DELAY);
     const bool detail_active = state.detail_active;
-    if (detail_active) {
+    if (detail_active)
+    {
         size_t visible[RADAR_MAX_AIRCRAFT];
         size_t visible_count = 0;
         size_t selected_position = 0;
         bool found_selected = false;
 
-        for (size_t i = 0; i < state.aircraft.count; ++i) {
+        for (size_t i = 0; i < state.aircraft.count; ++i)
+        {
             int x;
             int y;
-            if (!aircraft_screen_position(&state.aircraft.items[i], &state, &x, &y)) continue;
+            if (!aircraft_screen_position(&state.aircraft.items[i], &state, &x, &y))
+                continue;
             visible[visible_count] = i;
-            if (strcmp(state.selected_icao24, state.aircraft.items[i].icao24) == 0) {
+            if (strcmp(state.selected_icao24, state.aircraft.items[i].icao24) == 0)
+            {
                 selected_position = visible_count;
                 found_selected = true;
             }
             ++visible_count;
         }
 
-        if (visible_count == 0) {
+        if (visible_count == 0)
+        {
             state.detail_active = false;
             state.selected_icao24[0] = '\0';
             clear_details_locked();
-        } else {
-            if (!found_selected) selected_position = 0;
-            if (direction > 0) {
+        }
+        else
+        {
+            if (!found_selected)
+                selected_position = 0;
+            if (direction > 0)
+            {
                 selected_position = (selected_position + 1) % visible_count;
-            } else if (direction < 0) {
+            }
+            else if (direction < 0)
+            {
                 selected_position = (selected_position + visible_count - 1) % visible_count;
             }
             const char *next_icao24 = state.aircraft.items[visible[selected_position]].icao24;
-            if (strcmp(state.selected_icao24, next_icao24) != 0) {
+            if (strcmp(state.selected_icao24, next_icao24) != 0)
+            {
                 strlcpy(state.selected_icao24, next_icao24, sizeof(state.selected_icao24));
                 clear_details_locked();
             }
@@ -612,12 +924,16 @@ bool radar_display_rotate_selection(int direction)
 
 bool radar_display_get_selected_aircraft(radar_aircraft_t *aircraft)
 {
-    if (!aircraft) return false;
+    if (!aircraft)
+        return false;
     bool found = false;
     xSemaphoreTake(state_mutex, portMAX_DELAY);
-    if (state.detail_active) {
-        for (size_t i = 0; i < state.aircraft.count; ++i) {
-            if (strcmp(state.selected_icao24, state.aircraft.items[i].icao24) == 0) {
+    if (state.detail_active)
+    {
+        for (size_t i = 0; i < state.aircraft.count; ++i)
+        {
+            if (strcmp(state.selected_icao24, state.aircraft.items[i].icao24) == 0)
+            {
                 *aircraft = state.aircraft.items[i];
                 found = true;
                 break;
@@ -630,9 +946,11 @@ bool radar_display_get_selected_aircraft(radar_aircraft_t *aircraft)
 
 void radar_display_set_details_loading(const char *icao24)
 {
-    if (!icao24) return;
+    if (!icao24)
+        return;
     xSemaphoreTake(state_mutex, portMAX_DELAY);
-    if (state.detail_active && strcmp(state.selected_icao24, icao24) == 0) {
+    if (state.detail_active && strcmp(state.selected_icao24, icao24) == 0)
+    {
         state.details_state = DETAILS_LOADING;
         memset(&state.details, 0, sizeof(state.details));
     }
@@ -643,9 +961,11 @@ void radar_display_set_aircraft_details(const char *icao24,
                                         const radar_aircraft_details_t *details,
                                         bool available)
 {
-    if (!icao24 || !details) return;
+    if (!icao24 || !details)
+        return;
     xSemaphoreTake(state_mutex, portMAX_DELAY);
-    if (state.detail_active && strcmp(state.selected_icao24, icao24) == 0) {
+    if (state.detail_active && strcmp(state.selected_icao24, icao24) == 0)
+    {
         state.details = *details;
         state.details_state = available ? DETAILS_READY : DETAILS_UNAVAILABLE;
     }

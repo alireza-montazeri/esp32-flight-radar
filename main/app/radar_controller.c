@@ -60,9 +60,9 @@ static void update_radius(EventBits_t encoder_bits)
     radar_config_t snapshot;
     xSemaphoreTake(config_mutex, portMAX_DELAY);
     if (encoder_bits & BIT0)
-        app_config.radius_deg -= RADAR_RADIUS_STEP_DEG;
-    if (encoder_bits & BIT1)
         app_config.radius_deg += RADAR_RADIUS_STEP_DEG;
+    if (encoder_bits & BIT1)
+        app_config.radius_deg -= RADAR_RADIUS_STEP_DEG;
     if (app_config.radius_deg < RADAR_RADIUS_MIN_DEG)
     {
         app_config.radius_deg = RADAR_RADIUS_MIN_DEG;

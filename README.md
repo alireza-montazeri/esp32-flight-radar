@@ -182,8 +182,8 @@ that Wi-Fi connection rather than Ethernet, cellular data, or a VPN.
 | Latitude            | Radar centre in signed decimal degrees, from -90 to 90              |
 | Longitude           | Radar centre in signed decimal degrees, from -180 to 180            |
 | Radius              | 0.05 to 2.5 degrees                                                 |
-| Animated sweep      | Enables the rotating green radar line                               |
-| Aircraft labels     | Shows callsign/ICAO address and altitude                            |
+| Animated sweep      | Enables the rotating, fading green radar beam                       |
+| Aircraft labels     | Shows the callsign or ICAO24 address                                |
 | OAuth client ID     | Optional OpenSky API client ID                                      |
 | OAuth client secret | Optional OpenSky API client secret; blank retains the stored secret |
 
@@ -195,7 +195,10 @@ stored in NVS flash.
 
 A radius of 0.05 degrees is approximately 5.6 km north/south. East/west distance
 varies with latitude and is approximately `5.6 × cos(latitude)` km. The default
-radius of 0.75 degrees is approximately 83 km north/south.
+radius of 0.75 degrees is approximately 83 km north/south. Degrees remain the
+stored source of truth; the on-screen scale converts the radius to kilometres
+and rounds it to a whole number. The scale is measured from the radar centre to
+the outer ring, so the full edge-to-edge diameter is twice the displayed value.
 
 After saving, the ESP32 restarts and attempts to join the configured Wi-Fi
 network. If it cannot connect within approximately 20 seconds, it enables
@@ -242,10 +245,10 @@ anonymous access.
 After Wi-Fi connection, the radar fetches nearby aircraft and shows:
 
 - Green aircraft symbols for airborne aircraft
-- Amber aircraft symbols for aircraft reported on the ground
-- Aircraft heading through symbol orientation
+- Aircraft reported by OpenSky as on the ground are excluded
+- GPS-style aircraft symbols rotated to the nearest of 16 heading directions
 - Callsign, or ICAO24 address when no callsign is available
-- Barometric altitude in feet
+- OpenSky-native units: altitude in metres and speed/vertical rate in metres per second
 - Icon-based aircraft count, selected range, connection state, and update status
 
 Opening the detail card starts a best-effort lookup through the public
@@ -289,7 +292,7 @@ Controls:
 
 | Control                    | Action                                            |
 | -------------------------- | ------------------------------------------------- |
-| Rotate knob                | Increase or decrease radar radius by 0.05 degrees |
+| Rotate knob                | Increase or decrease radar radius                 |
 | Knob vibration             | Confirms a detected rotation step                 |
 | Tap an aircraft            | Open its live detail card                         |
 | Rotate knob with card open | Select the previous or next visible aircraft      |
@@ -299,9 +302,11 @@ The selected knob radius is written to NVS after the knob has been idle for
 approximately 1.5 seconds. Opening and closing the detail card does not change
 the configured aircraft-label setting.
 
-Aircraft movement is projected between OpenSky responses using reported
-velocity and track. This makes movement smoother but does not create new
-position data.
+Between OpenSky responses, the firmware projects aircraft using their reported
+velocity and track. A projected position is committed to the visible radar only
+when the sweep's leading edge crosses that aircraft's bearing. The icon then
+remains fixed until the next sweep, recreating a traditional scanned-radar
+display without presenting the projection as a continuous live measurement.
 
 ## Reopen or change configuration
 

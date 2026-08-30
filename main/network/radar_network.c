@@ -233,8 +233,10 @@ esp_err_t radar_network_fetch_aircraft(const radar_config_t *config,
     char url[384];
     snprintf(url, sizeof(url),
              "https://opensky-network.org/api/states/all?lamin=%.6f&lamax=%.6f&lomin=%.6f&lomax=%.6f&extended=1",
-             config->latitude - config->radius_deg, config->latitude + config->radius_deg,
-             config->longitude - config->radius_deg, config->longitude + config->radius_deg);
+             config->latitude - config->radius_deg,
+             config->latitude + config->radius_deg,
+             config->longitude - config->radius_deg,
+             config->longitude + config->radius_deg);
 
     response_buffer_t response;
     ESP_LOGI(TAG, "OpenSky states request started");
@@ -265,6 +267,9 @@ esp_err_t radar_network_fetch_aircraft(const radar_config_t *config,
         if (aircraft->count >= RADAR_MAX_AIRCRAFT) break;
         if (!cJSON_IsArray(entry) || !cJSON_IsNumber(cJSON_GetArrayItem(entry, 5)) ||
             !cJSON_IsNumber(cJSON_GetArrayItem(entry, 6))) continue;
+        cJSON *ground = cJSON_GetArrayItem(entry, 8);
+        if (cJSON_IsTrue(ground)) continue;
+
         radar_aircraft_t *item = &aircraft->items[aircraft->count++];
         copy_json_string(entry, 0, item->icao24, sizeof(item->icao24));
         copy_json_string(entry, 1, item->callsign, sizeof(item->callsign));
@@ -272,8 +277,7 @@ esp_err_t radar_network_fetch_aircraft(const radar_config_t *config,
         item->longitude = json_number(entry, 5, 0);
         item->latitude = json_number(entry, 6, 0);
         item->altitude_m = json_number(entry, 7, 0);
-        cJSON *ground = cJSON_GetArrayItem(entry, 8);
-        item->on_ground = cJSON_IsTrue(ground);
+        item->on_ground = false;
         item->velocity_mps = json_number(entry, 9, 0);
         item->track_deg = json_number(entry, 10, 0);
         item->vertical_rate_mps = json_number(entry, 11, 0);
@@ -529,6 +533,7 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         connected = false;
+        radar_display_set_wifi_connected(false);
         if (wifi_retries++ < WIFI_MAX_RETRIES) {
             esp_wifi_connect();
         } else {
@@ -537,6 +542,7 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         wifi_retries = 0;
         connected = true;
+        radar_display_set_wifi_connected(true);
         xEventGroupSetBits(wifi_events, WIFI_CONNECTED_BIT);
         start_mdns();
         radar_display_set_status("Open flight-radar.local to configure");

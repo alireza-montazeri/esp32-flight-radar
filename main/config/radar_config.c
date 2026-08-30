@@ -41,7 +41,8 @@ esp_err_t radar_config_load(radar_config_t *config)
     get_string(nvs, "client_secret", config->opensky_client_secret, sizeof(config->opensky_client_secret));
     (void)nvs_get_blob(nvs, "latitude", &config->latitude, &(size_t){sizeof(config->latitude)});
     (void)nvs_get_blob(nvs, "longitude", &config->longitude, &(size_t){sizeof(config->longitude)});
-    (void)nvs_get_blob(nvs, "radius", &config->radius_deg, &(size_t){sizeof(config->radius_deg)});
+    (void)nvs_get_blob(nvs, "radius", &config->radius_deg,
+                       &(size_t){sizeof(config->radius_deg)});
     uint8_t flag;
     if (nvs_get_u8(nvs, "sweep", &flag) == ESP_OK) config->show_sweep = flag != 0;
     if (nvs_get_u8(nvs, "labels", &flag) == ESP_OK) config->show_labels = flag != 0;
