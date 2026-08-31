@@ -14,6 +14,7 @@
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_sntp.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -27,6 +28,14 @@
 #define WIFI_FAILED_BIT    BIT1
 #define WIFI_MAX_RETRIES   8
 #define RESPONSE_LIMIT     (256 * 1024)
+#define MELBOURNE_WEATHER_URL                                                   \
+    "https://api.open-meteo.com/v1/forecast?latitude=-37.8136&longitude="       \
+    "144.9631&current=temperature_2m,weather_code&daily=temperature_2m_max,"    \
+    "temperature_2m_min,uv_index_max&timezone=Australia%2FMelbourne&forecast_days=1"
+#define TEHRAN_WEATHER_URL                                                      \
+    "https://api.open-meteo.com/v1/forecast?latitude=35.6892&longitude="        \
+    "51.3890&current=temperature_2m,weather_code&daily=temperature_2m_max,"     \
+    "temperature_2m_min,uv_index_max&timezone=Asia%2FTehran&forecast_days=1"
 
 typedef struct {
     char *data;
@@ -46,6 +55,15 @@ static radar_config_t web_config;
 static httpd_handle_t web_server;
 static char bearer_token[2048];
 static int64_t bearer_expiry_us;
+
+static void start_time_sync(void)
+{
+    if (esp_sntp_enabled()) return;
+    esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_init();
+    ESP_LOGI(TAG, "SNTP time synchronization started");
+}
 
 static esp_err_t http_event(esp_http_client_event_t *event)
 {
@@ -217,6 +235,75 @@ static void copy_object_string(cJSON *object, const char *name, char *dest, size
     cJSON *item = cJSON_GetObjectItemCaseSensitive(object, name);
     dest[0] = '\0';
     if (cJSON_IsString(item)) strlcpy(dest, item->valuestring, dest_size);
+}
+
+static bool weather_number(cJSON *object, const char *name, float *value)
+{
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(object, name);
+    if (!cJSON_IsNumber(item)) return false;
+    *value = (float)item->valuedouble;
+    return isfinite(*value);
+}
+
+static bool weather_daily_number(cJSON *daily, const char *name, float *value)
+{
+    cJSON *array = cJSON_GetObjectItemCaseSensitive(daily, name);
+    cJSON *item = cJSON_IsArray(array) ? cJSON_GetArrayItem(array, 0) : NULL;
+    if (!cJSON_IsNumber(item)) return false;
+    *value = (float)item->valuedouble;
+    return isfinite(*value);
+}
+
+esp_err_t radar_network_fetch_city_weather(radar_city_t city,
+                                           radar_weather_t *weather,
+                                           int *http_status)
+{
+    if (!weather || !http_status || city < 0 || city >= RADAR_CITY_COUNT)
+        return ESP_ERR_INVALID_ARG;
+
+    const char *url = city == RADAR_CITY_TEHRAN
+                          ? TEHRAN_WEATHER_URL
+                          : MELBOURNE_WEATHER_URL;
+
+    response_buffer_t response;
+    esp_err_t err = perform_http(url, HTTP_METHOD_GET, NULL,
+                                 NULL, &response, http_status, 15000);
+    if (err != ESP_OK || *http_status != 200 || !response.data) {
+        free(response.data);
+        return err == ESP_OK ? ESP_FAIL : err;
+    }
+
+    cJSON *root = cJSON_Parse(response.data);
+    free(response.data);
+    cJSON *current = root ? cJSON_GetObjectItemCaseSensitive(root, "current") : NULL;
+    cJSON *daily = root ? cJSON_GetObjectItemCaseSensitive(root, "daily") : NULL;
+    cJSON *weather_code = current
+                              ? cJSON_GetObjectItemCaseSensitive(current, "weather_code")
+                              : NULL;
+    cJSON *utc_offset = root
+                            ? cJSON_GetObjectItemCaseSensitive(root,
+                                                               "utc_offset_seconds")
+                            : NULL;
+
+    radar_weather_t parsed = {0};
+    const bool valid = cJSON_IsObject(current) && cJSON_IsObject(daily) &&
+                       cJSON_IsNumber(weather_code) && cJSON_IsNumber(utc_offset) &&
+                       weather_number(current, "temperature_2m",
+                                      &parsed.temperature_c) &&
+                       weather_daily_number(daily, "temperature_2m_max",
+                                            &parsed.high_c) &&
+                       weather_daily_number(daily, "temperature_2m_min",
+                                            &parsed.low_c) &&
+                       weather_daily_number(daily, "uv_index_max",
+                                            &parsed.uv_index_max);
+    if (valid) {
+        parsed.weather_code = weather_code->valueint;
+        parsed.utc_offset_seconds = utc_offset->valueint;
+        parsed.valid = true;
+        *weather = parsed;
+    }
+    cJSON_Delete(root);
+    return valid ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
 }
 
 esp_err_t radar_network_fetch_aircraft(const radar_config_t *config,
@@ -553,6 +640,7 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         wifi_retries = 0;
         connected = true;
         radar_display_set_wifi_connected(true);
+        start_time_sync();
         xEventGroupSetBits(wifi_events, WIFI_CONNECTED_BIT);
         start_mdns();
         radar_display_set_status("Open flight-radar.local to configure");

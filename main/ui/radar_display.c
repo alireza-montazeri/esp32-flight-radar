@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -29,6 +30,11 @@
 #define RADAR_FRAME_PERIOD_MS 50
 #define KILOMETRES_PER_DEGREE 111.32
 #define RADAR_AIRPORT_LABEL_WIDTH 30
+#define PAGE_TRANSITION_MS 320
+#define PAGE_SWIPE_THRESHOLD_PX 56
+#define PAGE_DRAG_SLOP_PX 8
+#define CLOCK_RADIUS_PX 164
+#define CITY_SWITCH_ENCODER_EVENTS 3
 
 typedef enum
 {
@@ -51,6 +57,11 @@ typedef struct
     bool show_coastlines;
     bool wifi_connected;
     bool detail_active;
+    radar_weather_t weather[RADAR_CITY_COUNT];
+    radar_city_t active_city;
+    int city_rotation_events;
+    int battery_percentage;
+    bool battery_valid;
     char selected_icao24[7];
     details_state_t details_state;
     radar_aircraft_details_t details;
@@ -64,6 +75,13 @@ static double previous_sweep_angle;
 static bool sweep_angle_initialized;
 static lv_obj_t *canvas;
 static lv_color_t *canvas_buffer;
+static lv_obj_t *clock_canvas;
+static lv_color_t *clock_canvas_buffer;
+static bool clock_page_active;
+static bool page_drag_active;
+static bool suppress_canvas_click;
+static int page_drag_start_x;
+static int page_drag_start_radar_x;
 static lv_img_dsc_t aircraft_icon_images[AIRCRAFT_ICON_DIRECTIONS];
 static void *aircraft_icon_buffers[AIRCRAFT_ICON_DIRECTIONS];
 static bool aircraft_icons_ready;
@@ -337,8 +355,107 @@ static int find_nearest_aircraft(const display_state_t *snapshot, int tap_x, int
     return nearest;
 }
 
+static void set_page_x(void *object, int32_t x)
+{
+    lv_obj_set_x((lv_obj_t *)object, x);
+}
+
+static void animate_page_to(lv_obj_t *page, int32_t destination_x)
+{
+    lv_anim_del(page, set_page_x);
+    lv_anim_t animation;
+    lv_anim_init(&animation);
+    lv_anim_set_var(&animation, page);
+    lv_anim_set_exec_cb(&animation, set_page_x);
+    lv_anim_set_values(&animation, lv_obj_get_x(page), destination_x);
+    lv_anim_set_time(&animation, PAGE_TRANSITION_MS);
+    lv_anim_set_path_cb(&animation, lv_anim_path_ease_out);
+    lv_anim_start(&animation);
+}
+
+static void show_clock_page(bool show)
+{
+    xSemaphoreTake(state_mutex, portMAX_DELAY);
+    clock_page_active = show;
+    state.city_rotation_events = 0;
+    xSemaphoreGive(state_mutex);
+    animate_page_to(canvas, show ? -RADAR_SIZE : 0);
+    animate_page_to(clock_canvas, show ? 0 : RADAR_SIZE);
+}
+
+static void page_touch(lv_event_t *event)
+{
+    lv_indev_t *indev = lv_event_get_indev(event);
+    if (!indev)
+        return;
+
+    const lv_event_code_t code = lv_event_get_code(event);
+    lv_point_t point;
+    lv_indev_get_point(indev, &point);
+
+    if (code == LV_EVENT_PRESSED)
+    {
+        lv_anim_del(canvas, set_page_x);
+        lv_anim_del(clock_canvas, set_page_x);
+        page_drag_active = true;
+        page_drag_start_x = point.x;
+        page_drag_start_radar_x = lv_obj_get_x(canvas);
+        return;
+    }
+
+    if (!page_drag_active)
+        return;
+
+    const int delta_x = point.x - page_drag_start_x;
+
+    if (code == LV_EVENT_PRESSING)
+    {
+        int radar_x = page_drag_start_radar_x + delta_x;
+        if (radar_x > 0)
+            radar_x = 0;
+        else if (radar_x < -RADAR_SIZE)
+            radar_x = -RADAR_SIZE;
+        lv_obj_set_x(canvas, radar_x);
+        lv_obj_set_x(clock_canvas, radar_x + RADAR_SIZE);
+        return;
+    }
+
+    if (code != LV_EVENT_RELEASED && code != LV_EVENT_PRESS_LOST)
+        return;
+
+    page_drag_active = false;
+    if (code == LV_EVENT_PRESS_LOST)
+    {
+        suppress_canvas_click = false;
+        show_clock_page(clock_page_active);
+        return;
+    }
+
+    suppress_canvas_click = abs(delta_x) >= PAGE_DRAG_SLOP_PX &&
+                            lv_event_get_target(event) == canvas;
+    const bool show_clock = clock_page_active
+                                ? delta_x < PAGE_SWIPE_THRESHOLD_PX
+                                : delta_x <= -PAGE_SWIPE_THRESHOLD_PX;
+    show_clock_page(show_clock);
+}
+
+static void add_page_touch_events(lv_obj_t *page)
+{
+    lv_obj_add_event_cb(page, page_touch, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(page, page_touch, LV_EVENT_PRESSING, NULL);
+    lv_obj_add_event_cb(page, page_touch, LV_EVENT_RELEASED, NULL);
+    lv_obj_add_event_cb(page, page_touch, LV_EVENT_PRESS_LOST, NULL);
+}
+
 static void canvas_clicked(lv_event_t *event)
 {
+    if (suppress_canvas_click)
+    {
+        suppress_canvas_click = false;
+        return;
+    }
+    if (clock_page_active)
+        return;
     lv_indev_t *indev = lv_event_get_indev(event);
     if (!indev)
         return;
@@ -369,7 +486,8 @@ static void canvas_clicked(lv_event_t *event)
     xSemaphoreGive(state_mutex);
 }
 
-static void draw_line(int x1, int y1, int x2, int y2, lv_color_t color, uint8_t width, lv_opa_t opa)
+static void draw_canvas_line(lv_obj_t *target, int x1, int y1, int x2, int y2,
+                             lv_color_t color, uint8_t width, lv_opa_t opa)
 {
     lv_draw_line_dsc_t dsc;
     lv_draw_line_dsc_init(&dsc);
@@ -377,7 +495,13 @@ static void draw_line(int x1, int y1, int x2, int y2, lv_color_t color, uint8_t 
     dsc.width = width;
     dsc.opa = opa;
     lv_point_t points[] = {{x1, y1}, {x2, y2}};
-    lv_canvas_draw_line(canvas, points, 2, &dsc);
+    lv_canvas_draw_line(target, points, 2, &dsc);
+}
+
+static void draw_line(int x1, int y1, int x2, int y2, lv_color_t color,
+                      uint8_t width, lv_opa_t opa)
+{
+    draw_canvas_line(canvas, x1, y1, x2, y2, color, width, opa);
 }
 
 static void draw_text_font(int x, int y, int width, const char *text, lv_color_t color,
@@ -1079,6 +1203,381 @@ static void render_frame(const display_state_t *snapshot, double sweep_angle)
         draw_detail_card(snapshot);
 }
 
+static void draw_clock_text(int x, int y, int width, const char *text,
+                            lv_color_t color, const lv_font_t *font,
+                            lv_text_align_t align)
+{
+    lv_draw_label_dsc_t label;
+    lv_draw_label_dsc_init(&label);
+    label.color = color;
+    label.font = font;
+    label.align = align;
+    lv_canvas_draw_text(clock_canvas, x, y, width, &label, text);
+}
+
+static int clock_text_width(const char *text, const lv_font_t *font)
+{
+    return lv_txt_get_width(text, strlen(text), font, 0, LV_TEXT_FLAG_NONE);
+}
+
+static void draw_clock_circle(int x, int y, int radius, lv_color_t color,
+                              int width)
+{
+    lv_draw_arc_dsc_t arc;
+    lv_draw_arc_dsc_init(&arc);
+    arc.color = color;
+    arc.width = width;
+    arc.opa = LV_OPA_COVER;
+    lv_canvas_draw_arc(clock_canvas, x, y, radius, 0, 360, &arc);
+}
+
+static void draw_clock_hand(double angle, double length, lv_color_t color,
+                            uint8_t width)
+{
+    lv_draw_line_dsc_t hand;
+    lv_draw_line_dsc_init(&hand);
+    hand.color = color;
+    hand.width = width;
+    hand.opa = LV_OPA_COVER;
+    hand.round_start = true;
+    hand.round_end = true;
+    lv_point_t points[] = {
+        {RADAR_CENTER, RADAR_CENTER},
+        {RADAR_CENTER + (int)lround(cos(angle) * length),
+         RADAR_CENTER + (int)lround(sin(angle) * length)},
+    };
+    lv_canvas_draw_line(clock_canvas, points, 2, &hand);
+}
+
+static const char *weather_condition(int code)
+{
+    if (code == 0) return "Clear";
+    if (code <= 2) return "Partly cloudy";
+    if (code == 3) return "Overcast";
+    if (code == 45 || code == 48) return "Fog";
+    if (code >= 51 && code <= 57) return "Drizzle";
+    if ((code >= 61 && code <= 67) || (code >= 80 && code <= 82)) return "Rain";
+    if ((code >= 71 && code <= 77) || (code >= 85 && code <= 86)) return "Snow";
+    if (code >= 95) return "Thunderstorm";
+    return "Weather";
+}
+
+static void persian_month_day(const struct tm *gregorian, int *month, int *day)
+{
+    static const int days_before_month[] = {
+        0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334,
+    };
+    const int year = gregorian->tm_year + 1900;
+    const int year_from_1600 = year - 1600;
+    int gregorian_day = 365 * year_from_1600 +
+                        (year_from_1600 + 3) / 4 -
+                        (year_from_1600 + 99) / 100 +
+                        (year_from_1600 + 399) / 400 +
+                        days_before_month[gregorian->tm_mon] +
+                        gregorian->tm_mday - 1;
+    if (gregorian->tm_mon > 1 &&
+        ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0))
+    {
+        ++gregorian_day;
+    }
+
+    int persian_day = (gregorian_day - 79) % 12053;
+    persian_day %= 1461;
+    if (persian_day >= 366)
+        persian_day = (persian_day - 1) % 365;
+
+    if (persian_day < 186)
+    {
+        *month = persian_day / 31;
+        *day = persian_day % 31 + 1;
+    }
+    else
+    {
+        *month = 6 + (persian_day - 186) / 30;
+        *day = (persian_day - 186) % 30 + 1;
+    }
+}
+
+static void format_clock_date(radar_city_t city, const struct tm *local_time,
+                              char *weekday, size_t weekday_size,
+                              char *date, size_t date_size)
+{
+    static const char *const persian_months[] = {
+        "Farv", "Ordi", "Khor", "Tir", "Mord", "Shah",
+        "Mehr", "Aban", "Azar", "Dey", "Bahm", "Esf",
+    };
+
+    strftime(weekday, weekday_size,
+             city == RADAR_CITY_TEHRAN ? "%a," : "%a", local_time);
+    if (city == RADAR_CITY_TEHRAN)
+    {
+        int month;
+        int day;
+        persian_month_day(local_time, &month, &day);
+        snprintf(date, date_size, "%02d %s", day, persian_months[month]);
+    }
+    else
+    {
+        strftime(date, date_size, "%d %b", local_time);
+    }
+}
+
+static void draw_sun_icon(int x, int y, lv_color_t color)
+{
+    draw_clock_circle(x, y, 7, color, 2);
+    for (int ray = 0; ray < 8; ++ray) {
+        const double angle = ray * M_PI / 4.0;
+        draw_canvas_line(clock_canvas,
+                         x + (int)lround(cos(angle) * 11.0),
+                         y + (int)lround(sin(angle) * 11.0),
+                         x + (int)lround(cos(angle) * 15.0),
+                         y + (int)lround(sin(angle) * 15.0),
+                         color, 1, LV_OPA_COVER);
+    }
+}
+
+static void draw_cloud_icon(int x, int y, lv_color_t color)
+{
+    draw_clock_circle(x - 8, y + 2, 7, color, 2);
+    draw_clock_circle(x, y - 3, 10, color, 2);
+    draw_clock_circle(x + 10, y + 2, 7, color, 2);
+    draw_canvas_line(clock_canvas, x - 14, y + 8, x + 16, y + 8,
+                     color, 2, LV_OPA_COVER);
+}
+
+static void draw_weather_icon(int code, int x, int y)
+{
+    const lv_color_t white = lv_color_white();
+    const lv_color_t green = lv_color_hex(0x5cff72);
+    const lv_color_t yellow = lv_color_hex(0xe8ed45);
+
+    if (code == 0) {
+        draw_sun_icon(x, y, yellow);
+        return;
+    }
+    if (code <= 2) {
+        draw_sun_icon(x - 7, y - 5, yellow);
+        draw_cloud_icon(x + 3, y + 3, white);
+        return;
+    }
+    if (code == 45 || code == 48) {
+        for (int line = -1; line <= 1; ++line)
+            draw_canvas_line(clock_canvas, x - 15, y + line * 6,
+                             x + 15, y + line * 6, white, 2, LV_OPA_COVER);
+        return;
+    }
+
+    draw_cloud_icon(x, y - 4, white);
+    if ((code >= 51 && code <= 67) || (code >= 80 && code <= 82)) {
+        for (int drop = -1; drop <= 1; ++drop)
+            draw_canvas_line(clock_canvas, x + drop * 9, y + 8,
+                             x + drop * 9 - 3, y + 14, green, 2, LV_OPA_COVER);
+    } else if ((code >= 71 && code <= 77) || (code >= 85 && code <= 86)) {
+        for (int flake = -1; flake <= 1; ++flake) {
+            draw_canvas_line(clock_canvas, x + flake * 9 - 2, y + 11,
+                             x + flake * 9 + 2, y + 15, white, 1, LV_OPA_COVER);
+            draw_canvas_line(clock_canvas, x + flake * 9 + 2, y + 11,
+                             x + flake * 9 - 2, y + 15, white, 1, LV_OPA_COVER);
+        }
+    } else if (code >= 95) {
+        lv_point_t bolt[] = {{x + 2, y + 7}, {x - 3, y + 16},
+                             {x + 3, y + 14}, {x, y + 21}};
+        lv_draw_line_dsc_t bolt_style;
+        lv_draw_line_dsc_init(&bolt_style);
+        bolt_style.color = yellow;
+        bolt_style.width = 2;
+        lv_canvas_draw_line(clock_canvas, bolt, 4, &bolt_style);
+    }
+}
+
+static void draw_battery(const display_state_t *snapshot)
+{
+    const lv_color_t green = lv_color_hex(0x5cff72);
+    const lv_color_t amber = lv_color_hex(0xffc857);
+    const lv_color_t red = lv_color_hex(0xff5c68);
+    const lv_color_t white = lv_color_white();
+    const lv_color_t grey = lv_color_hex(0xaeb2b7);
+    const int percentage = snapshot->battery_valid
+                               ? snapshot->battery_percentage
+                               : 0;
+
+    char label[8];
+    if (snapshot->battery_valid)
+        snprintf(label, sizeof(label), "%d%%", percentage);
+    else
+        strlcpy(label, "--%", sizeof(label));
+
+    const int icon_width = 23;
+    const int gap = 6;
+    const int label_width = clock_text_width(label, &lv_font_montserrat_10);
+    const int group_x = RADAR_CENTER - (icon_width + gap + label_width) / 2;
+    const lv_color_t level_color = !snapshot->battery_valid ? grey
+                                    : percentage <= 15 ? red
+                                    : percentage <= 40 ? amber
+                                                       : green;
+
+    lv_draw_rect_dsc_t outline;
+    lv_draw_rect_dsc_init(&outline);
+    outline.bg_opa = LV_OPA_TRANSP;
+    outline.border_color = snapshot->battery_valid ? white : grey;
+    outline.border_width = 1;
+    outline.radius = 2;
+    lv_canvas_draw_rect(clock_canvas, group_x, 116, 20, 10, &outline);
+
+    lv_draw_rect_dsc_t terminal;
+    lv_draw_rect_dsc_init(&terminal);
+    terminal.bg_color = snapshot->battery_valid ? white : grey;
+    terminal.bg_opa = LV_OPA_COVER;
+    terminal.radius = 1;
+    lv_canvas_draw_rect(clock_canvas, group_x + 21, 119, 2, 4, &terminal);
+
+    if (snapshot->battery_valid && percentage > 0) {
+        lv_draw_rect_dsc_t fill;
+        lv_draw_rect_dsc_init(&fill);
+        fill.bg_color = level_color;
+        fill.bg_opa = LV_OPA_COVER;
+        fill.radius = 1;
+        const int fill_width = fmax(1, (percentage * 16 + 99) / 100);
+        lv_canvas_draw_rect(clock_canvas, group_x + 2, 118, fill_width, 6, &fill);
+    }
+
+    draw_clock_text(group_x + icon_width + gap, 115, label_width, label,
+                    snapshot->battery_valid ? level_color : grey,
+                    &lv_font_montserrat_10,
+                    LV_TEXT_ALIGN_LEFT);
+}
+
+static void render_clock(const display_state_t *snapshot,
+                         const struct tm *local_time)
+{
+    const lv_color_t green = lv_color_hex(0x5cff72);
+    const lv_color_t white = lv_color_white();
+    const lv_color_t grey = lv_color_hex(0xaeb2b7);
+    const lv_color_t dim = lv_color_hex(0x555b60);
+    const radar_weather_t *weather = &snapshot->weather[snapshot->active_city];
+    const char *city_name = snapshot->active_city == RADAR_CITY_TEHRAN
+                                ? "Tehran"
+                                : "Melbourne";
+    lv_canvas_fill_bg(clock_canvas, lv_color_black(), LV_OPA_COVER);
+
+    draw_clock_circle(RADAR_CENTER, RADAR_CENTER, CLOCK_RADIUS_PX,
+                      lv_color_hex(0x15191d), 2);
+    for (int marker = 0; marker < 60; ++marker) {
+        const double angle = marker * 2.0 * M_PI / 60.0 - M_PI / 2.0;
+        const bool cardinal = marker % 15 == 0;
+        const bool hour = marker % 5 == 0;
+        const double inner_radius = cardinal ? 140.0 : (hour ? 145.0 : 152.0);
+        draw_canvas_line(clock_canvas,
+                         RADAR_CENTER + (int)lround(cos(angle) * inner_radius),
+                         RADAR_CENTER + (int)lround(sin(angle) * inner_radius),
+                         RADAR_CENTER + (int)lround(cos(angle) * 158.0),
+                         RADAR_CENTER + (int)lround(sin(angle) * 158.0),
+                         cardinal ? green : (hour ? white : dim),
+                         cardinal ? 4 : (hour ? 3 : 1), LV_OPA_COVER);
+    }
+
+    char weekday[12];
+    char date[16];
+    format_clock_date(snapshot->active_city, local_time,
+                      weekday, sizeof(weekday), date, sizeof(date));
+    draw_clock_text(110, 53, 140, weekday, white, &lv_font_montserrat_16,
+                    LV_TEXT_ALIGN_CENTER);
+    draw_clock_text(100, 76, 160, date, white, &lv_font_montserrat_20,
+                    LV_TEXT_ALIGN_CENTER);
+    draw_battery(snapshot);
+
+    draw_clock_text(90, 214, 180, city_name, white,
+                    &lv_font_montserrat_12, LV_TEXT_ALIGN_CENTER);
+
+    char temperature[12];
+    char conditions[24];
+    char forecast[48];
+    if (weather->valid) {
+        snprintf(temperature, sizeof(temperature), "%.0f°",
+                 weather->temperature_c);
+        strlcpy(conditions, weather_condition(weather->weather_code),
+                sizeof(conditions));
+        snprintf(forecast, sizeof(forecast), "H: %.0f°   L: %.0f°   UV: %.0f",
+                 weather->high_c, weather->low_c, weather->uv_index_max);
+    } else {
+        strlcpy(temperature, "--°", sizeof(temperature));
+        strlcpy(conditions, "Weather unavailable", sizeof(conditions));
+        strlcpy(forecast, "H: --   L: --   UV: --", sizeof(forecast));
+    }
+
+    const int temperature_width = clock_text_width(
+        temperature, &lv_font_montserrat_20);
+    const int conditions_width = clock_text_width(
+        conditions, &lv_font_montserrat_10);
+    const int weather_text_width = temperature_width > conditions_width
+                                       ? temperature_width
+                                       : conditions_width;
+    const int weather_icon_width = 44;
+    const int weather_gap = 8;
+    const int weather_group_x = RADAR_CENTER -
+                                (weather_icon_width + weather_gap +
+                                 weather_text_width) / 2;
+    draw_weather_icon(weather->valid ? weather->weather_code : 3,
+                      weather_group_x + weather_icon_width / 2, 250);
+    draw_clock_text(weather_group_x + weather_icon_width + weather_gap, 236,
+                    weather_text_width, temperature, white,
+                    &lv_font_montserrat_20,
+                    LV_TEXT_ALIGN_LEFT);
+    draw_clock_text(weather_group_x + weather_icon_width + weather_gap, 259,
+                    weather_text_width, conditions, grey,
+                    &lv_font_montserrat_10,
+                    LV_TEXT_ALIGN_LEFT);
+    draw_clock_text(52, 282, 256, forecast, white, &lv_font_montserrat_14,
+                    LV_TEXT_ALIGN_CENTER);
+
+    /* Hands are deliberately last so they remain visible over every label. */
+    const double hour_angle =
+        ((local_time->tm_hour % 12) + local_time->tm_min / 60.0) *
+            2.0 * M_PI / 12.0 - M_PI / 2.0;
+    const double minute_angle =
+        (local_time->tm_min + local_time->tm_sec / 60.0) *
+            2.0 * M_PI / 60.0 - M_PI / 2.0;
+    const double second_angle = local_time->tm_sec * 2.0 * M_PI / 60.0 -
+                                M_PI / 2.0;
+    draw_clock_hand(hour_angle, 78.0, white, 7);
+    draw_clock_hand(minute_angle, 120.0, white, 5);
+
+    draw_canvas_line(clock_canvas,
+                     RADAR_CENTER - (int)lround(cos(second_angle) * 20.0),
+                     RADAR_CENTER - (int)lround(sin(second_angle) * 20.0),
+                     RADAR_CENTER + (int)lround(cos(second_angle) * 138.0),
+                     RADAR_CENTER + (int)lround(sin(second_angle) * 138.0),
+                     green, 2, LV_OPA_COVER);
+    draw_clock_circle(
+        RADAR_CENTER + (int)lround(cos(second_angle) * 124.0),
+        RADAR_CENTER + (int)lround(sin(second_angle) * 124.0),
+        5, green, 2);
+    draw_clock_circle(RADAR_CENTER, RADAR_CENTER, 8, white, 5);
+    draw_clock_circle(RADAR_CENTER, RADAR_CENTER, 4, green, 5);
+}
+
+static void get_city_local_time(const display_state_t *snapshot, time_t now,
+                                struct tm *city_time)
+{
+    const radar_weather_t *weather = &snapshot->weather[snapshot->active_city];
+    if (weather->valid)
+    {
+        const time_t shifted = now + weather->utc_offset_seconds;
+        gmtime_r(&shifted, city_time);
+    }
+    else if (snapshot->active_city == RADAR_CITY_TEHRAN)
+    {
+        /* Tehran currently observes UTC+03:30 and has no seasonal clock shift. */
+        const time_t shifted = now + 3 * 60 * 60 + 30 * 60;
+        gmtime_r(&shifted, city_time);
+    }
+    else
+    {
+        /* The process TZ is configured for Melbourne during application setup. */
+        localtime_r(&now, city_time);
+    }
+}
+
 static void render_task(void *arg)
 {
     (void)arg;
@@ -1087,6 +1586,8 @@ static void render_task(void *arg)
     if (!snapshot)
         snapshot = malloc(sizeof(*snapshot));
     assert(snapshot);
+    time_t last_clock_second = (time_t)-1;
+    radar_city_t last_clock_city = RADAR_CITY_COUNT;
 
     while (true)
     {
@@ -1101,6 +1602,16 @@ static void render_task(void *arg)
         if (waveshare_display_lock(1000))
         {
             render_frame(snapshot, sweep_angle);
+            const time_t now = time(NULL);
+            if (now != last_clock_second ||
+                snapshot->active_city != last_clock_city)
+            {
+                struct tm local_time;
+                get_city_local_time(snapshot, now, &local_time);
+                render_clock(snapshot, &local_time);
+                last_clock_second = now;
+                last_clock_city = snapshot->active_city;
+            }
             waveshare_display_unlock();
         }
         vTaskDelay(pdMS_TO_TICKS(RADAR_FRAME_PERIOD_MS));
@@ -1120,10 +1631,16 @@ void radar_display_init(void)
     state.show_coastlines = false;
     state.wifi_connected = false;
     state.detail_active = false;
+    memset(state.weather, 0, sizeof(state.weather));
+    state.active_city = RADAR_CITY_MELBOURNE;
+    state.city_rotation_events = 0;
+    state.battery_percentage = 0;
+    state.battery_valid = false;
     state.selected_icao24[0] = '\0';
     memset(&pending_aircraft, 0, sizeof(pending_aircraft));
     previous_sweep_angle = 0.0;
     sweep_angle_initialized = false;
+    clock_page_active = false;
     clear_details_locked();
     strlcpy(state.status, "Flight Radar starting", sizeof(state.status));
 
@@ -1136,17 +1653,40 @@ void radar_display_init(void)
                                          MALLOC_CAP_8BIT);
     }
     assert(canvas_buffer);
+    clock_canvas_buffer = heap_caps_malloc(
+        LV_CANVAS_BUF_SIZE_TRUE_COLOR(RADAR_SIZE, RADAR_SIZE),
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!clock_canvas_buffer)
+    {
+        clock_canvas_buffer = heap_caps_malloc(
+            LV_CANVAS_BUF_SIZE_TRUE_COLOR(RADAR_SIZE, RADAR_SIZE), MALLOC_CAP_8BIT);
+    }
+    assert(clock_canvas_buffer);
 
     if (waveshare_display_lock(-1))
     {
         lv_obj_clean(lv_scr_act());
         lv_obj_set_style_bg_color(lv_scr_act(), lv_color_black(), 0);
+        lv_obj_clear_flag(lv_scr_act(), LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_scrollbar_mode(lv_scr_act(), LV_SCROLLBAR_MODE_OFF);
         canvas = lv_canvas_create(lv_scr_act());
         lv_canvas_set_buffer(canvas, canvas_buffer, RADAR_SIZE, RADAR_SIZE, LV_IMG_CF_TRUE_COLOR);
         lv_obj_center(canvas);
         init_rotated_aircraft_icons();
         lv_obj_add_flag(canvas, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_clear_flag(canvas, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_scrollbar_mode(canvas, LV_SCROLLBAR_MODE_OFF);
         lv_obj_add_event_cb(canvas, canvas_clicked, LV_EVENT_CLICKED, NULL);
+        add_page_touch_events(canvas);
+
+        clock_canvas = lv_canvas_create(lv_scr_act());
+        lv_canvas_set_buffer(clock_canvas, clock_canvas_buffer, RADAR_SIZE,
+                             RADAR_SIZE, LV_IMG_CF_TRUE_COLOR);
+        lv_obj_set_pos(clock_canvas, RADAR_SIZE, 0);
+        lv_obj_add_flag(clock_canvas, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_clear_flag(clock_canvas, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_scrollbar_mode(clock_canvas, LV_SCROLLBAR_MODE_OFF);
+        add_page_touch_events(clock_canvas);
         waveshare_display_unlock();
     }
     ESP_LOGI(DISPLAY_TAG, "360x360 radar display ready");
@@ -1176,6 +1716,24 @@ void radar_display_set_wifi_connected(bool connected)
 {
     xSemaphoreTake(state_mutex, portMAX_DELAY);
     state.wifi_connected = connected;
+    xSemaphoreGive(state_mutex);
+}
+
+void radar_display_set_weather(radar_city_t city,
+                               const radar_weather_t *weather)
+{
+    if (!weather || city < 0 || city >= RADAR_CITY_COUNT) return;
+    xSemaphoreTake(state_mutex, portMAX_DELAY);
+    state.weather[city] = *weather;
+    xSemaphoreGive(state_mutex);
+}
+
+void radar_display_set_battery(int percentage)
+{
+    xSemaphoreTake(state_mutex, portMAX_DELAY);
+    state.battery_percentage = percentage < 0 ? 0 :
+                               percentage > 100 ? 100 : percentage;
+    state.battery_valid = true;
     xSemaphoreGive(state_mutex);
 }
 
@@ -1211,6 +1769,25 @@ void radar_display_set_options(bool show_sweep, bool show_labels,
 bool radar_display_rotate_selection(int direction)
 {
     xSemaphoreTake(state_mutex, portMAX_DELAY);
+    if (clock_page_active)
+    {
+        if (direction > 0)
+            ++state.city_rotation_events;
+        else if (direction < 0)
+            --state.city_rotation_events;
+
+        if (state.city_rotation_events >= CITY_SWITCH_ENCODER_EVENTS ||
+            state.city_rotation_events <= -CITY_SWITCH_ENCODER_EVENTS)
+        {
+            state.active_city = state.active_city == RADAR_CITY_MELBOURNE
+                                    ? RADAR_CITY_TEHRAN
+                                    : RADAR_CITY_MELBOURNE;
+            state.city_rotation_events = 0;
+        }
+        xSemaphoreGive(state_mutex);
+        return true;
+    }
+
     const bool detail_active = state.detail_active;
     if (detail_active)
     {

@@ -6,6 +6,12 @@
 
 #define RADAR_MAX_AIRCRAFT 64
 
+typedef enum {
+    RADAR_CITY_MELBOURNE = 0,
+    RADAR_CITY_TEHRAN,
+    RADAR_CITY_COUNT,
+} radar_city_t;
+
 typedef struct {
     char icao24[7];
     char callsign[9];
@@ -26,6 +32,16 @@ typedef struct {
     radar_aircraft_t items[RADAR_MAX_AIRCRAFT];
     size_t count;
 } radar_aircraft_list_t;
+
+typedef struct {
+    float temperature_c;
+    float high_c;
+    float low_c;
+    float uv_index_max;
+    int weather_code;
+    int32_t utc_offset_seconds;
+    bool valid;
+} radar_weather_t;
 
 typedef struct {
     char icao24[7];

@@ -11,6 +11,7 @@
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "radar_battery.h"
 #include "radar_display.h"
 #include "radar_haptics.h"
 #include "radar_network.h"
@@ -29,6 +30,11 @@
 #define DETAILS_DEBOUNCE_MS 700
 #define DETAILS_CACHE_SIZE 8
 #define ERROR_RETRY_SECONDS 10
+#define WEATHER_REFRESH_SECONDS (15 * 60)
+#define WEATHER_RETRY_SECONDS 60
+#define WEATHER_TASK_STACK_BYTES (14 * 1024)
+#define BATTERY_REFRESH_SECONDS 30
+#define BATTERY_TASK_STACK_BYTES 3072
 
 typedef struct
 {
@@ -45,6 +51,7 @@ static SemaphoreHandle_t config_mutex;
 static TaskHandle_t knob_task_handle;
 static TaskHandle_t radar_task_handle;
 static TaskHandle_t details_task_handle;
+static TaskHandle_t weather_task_handle;
 static details_cache_entry_t details_cache[DETAILS_CACHE_SIZE];
 static uint32_t details_cache_sequence;
 
@@ -310,6 +317,65 @@ static void radar_task(void *arg)
     }
 }
 
+static void weather_task(void *arg)
+{
+    (void)arg;
+    static const char *const city_names[RADAR_CITY_COUNT] = {
+        [RADAR_CITY_MELBOURNE] = "Melbourne",
+        [RADAR_CITY_TEHRAN] = "Tehran",
+    };
+
+    while (true)
+    {
+        if (!radar_network_is_connected())
+        {
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
+
+        bool all_updated = true;
+        for (radar_city_t city = RADAR_CITY_MELBOURNE;
+             city < RADAR_CITY_COUNT; ++city)
+        {
+            radar_weather_t weather = {0};
+            int http_status = 0;
+            const esp_err_t err = radar_network_fetch_city_weather(
+                city, &weather, &http_status);
+            if (err == ESP_OK)
+            {
+                radar_display_set_weather(city, &weather);
+                ESP_LOGI(TAG, "%s weather updated: %.1f C, WMO %d",
+                         city_names[city], weather.temperature_c,
+                         weather.weather_code);
+            }
+            else
+            {
+                all_updated = false;
+                ESP_LOGW(TAG, "%s weather update failed: HTTP %d (%s)",
+                         city_names[city], http_status, esp_err_to_name(err));
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS((all_updated ? WEATHER_REFRESH_SECONDS
+                                              : WEATHER_RETRY_SECONDS) * 1000));
+    }
+}
+
+static void battery_task(void *arg)
+{
+    (void)arg;
+    while (true)
+    {
+        int percentage = 0;
+        const esp_err_t err = radar_battery_read_percentage(&percentage);
+        if (err == ESP_OK)
+            radar_display_set_battery(percentage);
+        else
+            ESP_LOGW(TAG, "Battery ADC read failed: %s", esp_err_to_name(err));
+        vTaskDelay(pdMS_TO_TICKS(BATTERY_REFRESH_SECONDS * 1000));
+    }
+}
+
 esp_err_t radar_controller_start(const radar_config_t *initial_config)
 {
     if (!initial_config)
@@ -319,6 +385,10 @@ esp_err_t radar_controller_start(const radar_config_t *initial_config)
     if (!config_mutex)
         return ESP_ERR_NO_MEM;
     app_config = *initial_config;
+
+    esp_err_t battery_err = radar_battery_init();
+    if (battery_err != ESP_OK)
+        return battery_err;
 
     user_encoder_init();
     BaseType_t created = xTaskCreate(knob_task, "radar_knob", KNOB_TASK_STACK_BYTES,
@@ -339,6 +409,34 @@ esp_err_t radar_controller_start(const radar_config_t *initial_config)
                           DETAILS_TASK_STACK_BYTES, NULL, 3, &details_task_handle);
     if (created != pdPASS)
     {
+        vTaskDelete(radar_task_handle);
+        radar_task_handle = NULL;
+        vTaskDelete(knob_task_handle);
+        knob_task_handle = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
+    created = xTaskCreate(weather_task, "city_weather",
+                          WEATHER_TASK_STACK_BYTES, NULL, 3, &weather_task_handle);
+    if (created != pdPASS)
+    {
+        vTaskDelete(details_task_handle);
+        details_task_handle = NULL;
+        vTaskDelete(radar_task_handle);
+        radar_task_handle = NULL;
+        vTaskDelete(knob_task_handle);
+        knob_task_handle = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
+    created = xTaskCreate(battery_task, "battery_monitor",
+                          BATTERY_TASK_STACK_BYTES, NULL, 2, NULL);
+    if (created != pdPASS)
+    {
+        vTaskDelete(weather_task_handle);
+        weather_task_handle = NULL;
+        vTaskDelete(details_task_handle);
+        details_task_handle = NULL;
         vTaskDelete(radar_task_handle);
         radar_task_handle = NULL;
         vTaskDelete(knob_task_handle);

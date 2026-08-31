@@ -1,5 +1,8 @@
 #include "radar_app.h"
 
+#include <stdlib.h>
+#include <time.h>
+
 #include "nvs_flash.h"
 #include "radar_config.h"
 #include "radar_controller.h"
@@ -30,12 +33,15 @@ esp_err_t radar_app_start(void)
     esp_err_t err = initialize_nvs();
     if (err != ESP_OK) return err;
 
-    radar_display_init();
-    ESP_ERROR_CHECK_WITHOUT_ABORT(radar_haptics_init());
-
     radar_config_t config;
     err = radar_config_load(&config);
     if (err != ESP_OK) return err;
+
+    setenv("TZ", "AEST-10AEDT,M10.1.0,M4.1.0/3", 1);
+    tzset();
+
+    radar_display_init();
+    ESP_ERROR_CHECK_WITHOUT_ABORT(radar_haptics_init());
     apply_display_config(&config);
 
     err = radar_network_start(&config);

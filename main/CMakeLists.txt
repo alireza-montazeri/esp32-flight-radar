@@ -8,6 +8,7 @@ idf_component_register(
         "data/airport_data.c"
         "data/coastline_data.c"
         "hardware/radar_haptics.c"
+        "hardware/radar_battery.c"
         "network/radar_network.c"
         "ui/radar_display.c"
     INCLUDE_DIRS
@@ -21,6 +22,7 @@ idf_component_register(
         "ui"
     REQUIRES
         cjson
+        esp_adc
         esp_event
         esp_http_client
         esp_http_server

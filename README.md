@@ -26,6 +26,11 @@ would also require an SDR or dedicated ADS-B RF front end and antenna.
 - Knob selection between visible aircraft while the detail card is open
 - On-demand airline/company and route enrichment
 - Animated radar sweep
+- Snap-swipe left for the analog clock and right to return; scrollbars are hidden
+- Melbourne and Tehran local-time/weather views, switched after three encoder
+  events while the clock is visible
+- Open-Meteo temperature, conditions, daily high/low, and UV forecasts refreshed
+  every 15 minutes, plus live battery level
 - Local configuration page at `http://flight-radar.local/`
 
 ## Hardware
@@ -197,6 +202,14 @@ coordinates for the centre of the area you want to observe. South and west
 coordinates are negative. Do not commit your actual coordinates to the
 repository; enter them only through the device's setup page, where they are
 stored in NVS flash.
+
+The clock screen is intentionally fixed to Melbourne, Australia, independently
+of the configurable radar centre. It synchronizes time over SNTP, applies
+Melbourne daylight-saving rules, and refreshes current temperature, conditions,
+today's high/low, and maximum UV from the key-free
+[Open-Meteo forecast API](https://open-meteo.com/en/docs) every 15 minutes. The
+battery indicator samples the board's GPIO1/ADC1 voltage divider and converts
+the measured Li-ion voltage to an estimated remaining percentage.
 
 A radius of 0.05 degrees is approximately 5.6 km north/south. East/west distance
 varies with latitude and is approximately `5.6 × cos(latitude)` km. The default
