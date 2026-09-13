@@ -20,6 +20,7 @@ void radar_config_defaults(radar_config_t *config)
     config->longitude = 0.0;
     config->radius_deg = 0.75;
     config->show_sweep = true;
+    config->update_on_sweep = false;
     config->show_labels = true;
     config->show_airports = true;
     config->show_coastlines = false;
@@ -48,6 +49,7 @@ esp_err_t radar_config_load(radar_config_t *config)
                        &(size_t){sizeof(config->radius_deg)});
     uint8_t flag;
     if (nvs_get_u8(nvs, "sweep", &flag) == ESP_OK) config->show_sweep = flag != 0;
+    if (nvs_get_u8(nvs, "sweep_update", &flag) == ESP_OK) config->update_on_sweep = flag != 0;
     if (nvs_get_u8(nvs, "labels", &flag) == ESP_OK) config->show_labels = flag != 0;
     if (nvs_get_u8(nvs, "airports", &flag) == ESP_OK) config->show_airports = flag != 0;
     if (nvs_get_u8(nvs, "coastlines", &flag) == ESP_OK) config->show_coastlines = flag != 0;
@@ -75,6 +77,7 @@ esp_err_t radar_config_save(const radar_config_t *config)
     SAVE(nvs_set_str(nvs, "client_id", config->opensky_client_id));
     SAVE(nvs_set_str(nvs, "client_secret", config->opensky_client_secret));
     SAVE(nvs_set_u8(nvs, "sweep", config->show_sweep));
+    SAVE(nvs_set_u8(nvs, "sweep_update", config->update_on_sweep));
     SAVE(nvs_set_u8(nvs, "labels", config->show_labels));
     SAVE(nvs_set_u8(nvs, "airports", config->show_airports));
     SAVE(nvs_set_u8(nvs, "coastlines", config->show_coastlines));

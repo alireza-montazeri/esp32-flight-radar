@@ -53,6 +53,7 @@ typedef struct
     double longitude;
     double radius_deg;
     bool show_sweep;
+    bool update_on_sweep;
     bool show_labels;
     bool show_airports;
     bool show_coastlines;
@@ -359,6 +360,18 @@ static bool update_aircraft_at_sweep_locked(double sweep_angle)
     }
 
     previous_sweep_angle = sweep_angle;
+    return ensure_selected_aircraft_locked();
+}
+
+static bool update_aircraft_continuously_locked(void)
+{
+    state.aircraft = pending_aircraft;
+    for (size_t i = 0; i < state.aircraft.count; ++i)
+    {
+        predicted_position(&pending_aircraft.items[i],
+                           &state.aircraft.items[i].latitude,
+                           &state.aircraft.items[i].longitude);
+    }
     return ensure_selected_aircraft_locked();
 }
 
@@ -1664,8 +1677,10 @@ static void render_task(void *arg)
             2.0 * M_PI);
         xSemaphoreTake(state_mutex, portMAX_DELAY);
         bool selection_updated = false;
-        if (state.show_sweep)
+        if (state.update_on_sweep)
             selection_updated = update_aircraft_at_sweep_locked(sweep_angle);
+        else
+            selection_updated = update_aircraft_continuously_locked();
         *snapshot = state;
         const bool clock_active = clock_page_active;
         const uint32_t current_clock_revision = clock_revision;
@@ -1696,9 +1711,7 @@ static void render_task(void *arg)
 
         const TickType_t wait_ticks = clock_active
                                           ? pdMS_TO_TICKS(RADAR_IDLE_WAIT_MS)
-                                      : snapshot->show_sweep
-                                          ? pdMS_TO_TICKS(RADAR_ANIMATION_PERIOD_MS)
-                                          : portMAX_DELAY;
+                                          : pdMS_TO_TICKS(RADAR_ANIMATION_PERIOD_MS);
         ulTaskNotifyTake(pdTRUE, wait_ticks);
     }
 }
@@ -1713,6 +1726,7 @@ void radar_display_init(void)
     state.longitude = 0.0;
     state.radius_deg = 0.75;
     state.show_sweep = true;
+    state.update_on_sweep = false;
     state.show_labels = true;
     state.show_airports = true;
     state.show_coastlines = false;
@@ -1792,7 +1806,7 @@ void radar_display_update_aircraft(const radar_aircraft_list_t *aircraft)
 {
     xSemaphoreTake(state_mutex, portMAX_DELAY);
     pending_aircraft = *aircraft;
-    if (!state.show_sweep)
+    if (!state.update_on_sweep)
     {
         state.aircraft = pending_aircraft;
         ensure_selected_aircraft_locked();
@@ -1877,20 +1891,22 @@ void radar_display_set_center(double latitude, double longitude, double radius_d
     notify_render_task();
 }
 
-void radar_display_set_options(bool show_sweep, bool show_labels,
+void radar_display_set_options(bool show_sweep, bool update_on_sweep,
+                               bool show_labels,
                                bool show_airports, bool show_coastlines)
 {
     xSemaphoreTake(state_mutex, portMAX_DELAY);
-    if (state.show_sweep != show_sweep)
+    if (state.update_on_sweep != update_on_sweep)
     {
         sweep_angle_initialized = false;
-        if (!show_sweep)
+        if (!update_on_sweep)
         {
             state.aircraft = pending_aircraft;
             ensure_selected_aircraft_locked();
         }
     }
     state.show_sweep = show_sweep;
+    state.update_on_sweep = update_on_sweep;
     state.show_labels = show_labels;
     state.show_airports = show_airports;
     state.show_coastlines = show_coastlines;

@@ -12,6 +12,7 @@ typedef struct {
     char opensky_client_id[96];
     char opensky_client_secret[128];
     bool show_sweep;
+    bool update_on_sweep;
     bool show_labels;
     bool show_airports;
     bool show_coastlines;

@@ -24,7 +24,8 @@ static esp_err_t initialize_nvs(void)
 static void apply_display_config(const radar_config_t *config)
 {
     radar_display_set_center(config->latitude, config->longitude, config->radius_deg);
-    radar_display_set_options(config->show_sweep, config->show_labels,
+    radar_display_set_options(config->show_sweep, config->update_on_sweep,
+                              config->show_labels,
                               config->show_airports, config->show_coastlines);
 }
 

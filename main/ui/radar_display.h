@@ -12,7 +12,8 @@ void radar_display_set_weather(radar_city_t city,
                                const radar_weather_t *weather);
 void radar_display_set_battery(int percentage);
 void radar_display_set_center(double latitude, double longitude, double radius_deg);
-void radar_display_set_options(bool show_sweep, bool show_labels,
+void radar_display_set_options(bool show_sweep, bool update_on_sweep,
+                               bool show_labels,
                                bool show_airports, bool show_coastlines);
 
 /** Cycles the detail card selection. Returns true when detail mode consumed the input. */

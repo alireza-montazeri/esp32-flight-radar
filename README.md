@@ -26,7 +26,7 @@ would also require an SDR or dedicated ADS-B RF front end and antenna.
 - Knob selection between visible aircraft while the detail card is open
 - On-demand airline/company and route enrichment
 - Animated radar sweep
-- Snap-swipe left for the analog clock and right to return; scrollbars are hidden
+- The analog clock opens first; swipe left for radar and right to return
 - Melbourne and Tehran local-time/weather views, switched after three encoder
   events while the clock is visible
 - Open-Meteo temperature, conditions, daily high/low, and UV forecasts refreshed
@@ -190,6 +190,7 @@ that Wi-Fi connection rather than Ethernet, cellular data, or a VPN.
 | Longitude           | Radar centre in signed decimal degrees, from -180 to 180            |
 | Radius              | 0.05 to 2.5 degrees                                                 |
 | Animated sweep      | Enables the rotating, fading green radar beam                       |
+| Position updates    | Updates continuously (default), or only as the sweep passes          |
 | Aircraft labels     | Shows the callsign or ICAO24 address                                |
 | Airports            | Shows bundled airport plus markers and codes                        |
 | Coastlines          | Shows the bundled Natural Earth coastline layer                     |
@@ -368,11 +369,12 @@ The selected knob radius is written to NVS after the knob has been idle for
 approximately 1.5 seconds. Opening and closing the detail card does not change
 the configured aircraft-label setting.
 
-Between OpenSky responses, the firmware projects aircraft using their reported
-velocity and track. A projected position is committed to the visible radar only
-when the sweep's leading edge crosses that aircraft's bearing. The icon then
-remains fixed until the next sweep, recreating a traditional scanned-radar
-display without presenting the projection as a continuous live measurement.
+Aircraft positions update continuously by default: each new OpenSky response is
+applied immediately, then positions are projected at the radar render rate using
+reported velocity and track. The optional sweep-update mode instead commits each
+projected position only when the sweep's leading edge crosses that aircraft's
+bearing. The icon remains fixed until the next sweep, recreating a traditional
+scanned radar display.
 
 ## Reopen or change configuration
 

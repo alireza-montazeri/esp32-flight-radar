@@ -518,8 +518,8 @@ static esp_err_t config_get(httpd_req_t *request)
     snprintf(page, 6144,
         "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
         "<title>Flight Radar Setup</title><style>body{background:#071109;color:#45ff70;font:16px monospace;max-width:700px;margin:auto;padding:24px}"
-        "fieldset,input,button{border:1px solid #24c950;background:#071109;color:#45ff70;padding:10px;margin:5px 0}label{display:block;margin-top:12px}"
-        "input{box-sizing:border-box;width:100%%}button{background:#24c950;color:#021a08;font-weight:bold;width:100%%}</style></head><body>"
+        "fieldset,input,select,button{border:1px solid #24c950;background:#071109;color:#45ff70;padding:10px;margin:5px 0}label{display:block;margin-top:12px}"
+        "input,select{box-sizing:border-box;width:100%%}button{background:#24c950;color:#021a08;font-weight:bold;width:100%%}</style></head><body>"
         "<h1>ESP32 Flight Radar</h1><p>Configure Wi-Fi and the radar centre. Blank password/secret fields keep their stored values.</p>"
         "<form method=post action=/save><fieldset><legend>Network</legend>"
         "<label>Wi-Fi SSID<input name=ssid maxlength=32 value='%s' required></label>"
@@ -528,6 +528,9 @@ static esp_err_t config_get(httpd_req_t *request)
         "<label>Longitude<input name=longitude type=number min=-180 max=180 step=.000001 value='%.6f' required></label>"
         "<label>Radius in degrees (0.05-2.5)<input name=radius type=number min=.05 max=2.5 step=.05 value='%.2f' required></label>"
         "<label><input style='width:auto' name=sweep type=checkbox %s> animated sweep</label>"
+        "<label>Aircraft position updates<select name=position_updates>"
+        "<option value=continuous %s>Continuous</option>"
+        "<option value=sweep %s>When radar sweep passes</option></select></label>"
         "<label><input style='width:auto' name=labels type=checkbox %s> aircraft labels</label>"
         "<label><input style='width:auto' name=airports type=checkbox %s> airports</label>"
         "<label><input style='width:auto' name=coastlines type=checkbox %s> coastlines</label>"
@@ -536,7 +539,10 @@ static esp_err_t config_get(httpd_req_t *request)
         "<label>OAuth client secret<input name=client_secret type=password maxlength=127></label></fieldset>"
         "<button type=submit>Save and restart</button></form><p>After connection: <b>http://flight-radar.local/</b></p></body></html>",
         current.wifi_ssid, current.latitude, current.longitude, current.radius_deg,
-        current.show_sweep ? "checked" : "", current.show_labels ? "checked" : "",
+        current.show_sweep ? "checked" : "",
+        current.update_on_sweep ? "" : "selected",
+        current.update_on_sweep ? "selected" : "",
+        current.show_labels ? "checked" : "",
         current.show_airports ? "checked" : "",
         current.show_coastlines ? "checked" : "",
         current.show_grounded ? "checked" : "",
@@ -577,6 +583,8 @@ static esp_err_t config_save(httpd_req_t *request)
     if (form_value(body, "client_secret", value, sizeof(value)) && value[0])
         strlcpy(updated.opensky_client_secret, value, sizeof(updated.opensky_client_secret));
     updated.show_sweep = strstr(body, "sweep=") != NULL;
+    if (form_value(body, "position_updates", value, sizeof(value)))
+        updated.update_on_sweep = strcmp(value, "sweep") == 0;
     updated.show_labels = strstr(body, "labels=") != NULL;
     updated.show_airports = strstr(body, "airports=") != NULL;
     updated.show_coastlines = strstr(body, "coastlines=") != NULL;
