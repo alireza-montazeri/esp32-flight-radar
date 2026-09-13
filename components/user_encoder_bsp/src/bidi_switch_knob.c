@@ -12,13 +12,16 @@
 #include "driver/gpio.h"
 #include "esp_attr.h"
 #include "esp_log.h"
-#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "bidi_switch_knob.h"
 
 static const char *TAG = "Knob";
 
 #define TICKS_INTERVAL 3
 #define DEBOUNCE_TICKS 2
+#define IDLE_STABLE_TICKS 4
+#define KNOB_TASK_STACK_BYTES 2048
 
 #define KNOB_CHECK(a, str, ret_val)                               \
     if (!(a))                                                     \
@@ -57,7 +60,7 @@ typedef struct Knob
 } knob_dev_t;
 
 static knob_dev_t *s_head_handle = NULL;
-static esp_timer_handle_t s_knob_timer_handle;
+static TaskHandle_t s_knob_task_handle;
 static bool s_is_timer_running = false;
 
 // 判定函数
@@ -102,13 +105,40 @@ static void knob_handler(knob_dev_t *knob)
 }
 
 // 这是timer的回调函数，定期执行
-static void knob_cb(void *args)
+static void knob_monitor_task(void *args)
 {
-    knob_dev_t *target;
-    for (target = s_head_handle; target; target = target->next)
+    (void)args;
+    while (true)
     {
-        knob_handler(target);
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        unsigned stable_ticks = 0;
+        while (stable_ticks < IDLE_STABLE_TICKS && s_is_timer_running)
+        {
+            bool changed = false;
+            for (knob_dev_t *target = s_head_handle; target; target = target->next)
+            {
+                const uint8_t previous_a = target->encoder_a_level;
+                const uint8_t previous_b = target->encoder_b_level;
+                knob_handler(target);
+                changed |= previous_a != target->encoder_a_level ||
+                           previous_b != target->encoder_b_level;
+            }
+            if (ulTaskNotifyTake(pdTRUE, 0) > 0)
+                changed = true;
+            stable_ticks = changed ? 0 : stable_ticks + 1;
+            vTaskDelay(pdMS_TO_TICKS(TICKS_INTERVAL));
+        }
     }
+}
+
+static void IRAM_ATTR knob_gpio_interrupt(void *arg)
+{
+    (void)arg;
+    BaseType_t higher_priority_task_woken = pdFALSE;
+    if (s_knob_task_handle && s_is_timer_running)
+        vTaskNotifyGiveFromISR(s_knob_task_handle, &higher_priority_task_woken);
+    if (higher_priority_task_woken)
+        portYIELD_FROM_ISR();
 }
 
 knob_handle_t iot_knob_create(const knob_config_t *config)
@@ -137,28 +167,51 @@ knob_handle_t iot_knob_create(const knob_config_t *config)
     knob->next = s_head_handle;
     s_head_handle = knob;
 
-    if (!s_knob_timer_handle)
+    if (!s_knob_task_handle)
     {
-        esp_timer_create_args_t knob_timer = {0};
-        knob_timer.arg = NULL;
-        knob_timer.callback = knob_cb;
-        knob_timer.dispatch_method = ESP_TIMER_TASK;
-        knob_timer.name = "knob_timer";
-        esp_timer_create(&knob_timer, &s_knob_timer_handle);
+        BaseType_t created = xTaskCreate(knob_monitor_task, "knob_monitor",
+                                         KNOB_TASK_STACK_BYTES, NULL, 3,
+                                         &s_knob_task_handle);
+        KNOB_CHECK_GOTO(created == pdPASS, "knob task create failed", _encoder_deinit);
     }
+
+    esp_err_t isr_err = gpio_install_isr_service(0);
+    KNOB_CHECK_GOTO(isr_err == ESP_OK || isr_err == ESP_ERR_INVALID_STATE,
+                    "GPIO ISR service install failed", _encoder_deinit);
+    KNOB_CHECK_GOTO(gpio_isr_handler_add(config->gpio_encoder_a,
+                                         knob_gpio_interrupt, knob) == ESP_OK,
+                    "encoder A interrupt init failed", _encoder_deinit);
+    KNOB_CHECK_GOTO(gpio_isr_handler_add(config->gpio_encoder_b,
+                                         knob_gpio_interrupt, knob) == ESP_OK,
+                    "encoder B interrupt init failed", _remove_a_interrupt);
 
     if (!s_is_timer_running)
     {
-        esp_timer_start_periodic(s_knob_timer_handle, TICKS_INTERVAL * 1000U);
         s_is_timer_running = true;
     }
 
     ESP_LOGI(TAG, "Iot Knob Config Succeed, encoder A:%d, encoder B:%d", config->gpio_encoder_a, config->gpio_encoder_b);
     return (knob_handle_t)knob;
 
+_remove_a_interrupt:
+    gpio_isr_handler_remove(config->gpio_encoder_a);
 _encoder_deinit:
+    for (knob_dev_t **entry = &s_head_handle; *entry; entry = &(*entry)->next)
+    {
+        if (*entry == knob)
+        {
+            *entry = knob->next;
+            break;
+        }
+    }
+    if (!s_head_handle && s_knob_task_handle)
+    {
+        vTaskDelete(s_knob_task_handle);
+        s_knob_task_handle = NULL;
+    }
     knob_gpio_deinit(config->gpio_encoder_b);
     knob_gpio_deinit(config->gpio_encoder_a);
+    free(knob);
     return NULL;
 }
 
@@ -167,8 +220,12 @@ esp_err_t iot_knob_delete(knob_handle_t knob_handle)
     esp_err_t ret = ESP_OK;
     KNOB_CHECK(NULL != knob_handle, "Pointer of handle is invalid", ESP_ERR_INVALID_ARG);
     knob_dev_t *knob = (knob_dev_t *)knob_handle;
-    ret = knob_gpio_deinit((int)(knob->usr_data));
-    KNOB_CHECK(ESP_OK == ret, "knob deinit failed", ESP_FAIL);
+    gpio_isr_handler_remove((int)(long)knob->encoder_a);
+    gpio_isr_handler_remove((int)(long)knob->encoder_b);
+    ret = knob_gpio_deinit((int)(long)knob->encoder_a);
+    KNOB_CHECK(ESP_OK == ret, "encoder A deinit failed", ESP_FAIL);
+    ret = knob_gpio_deinit((int)(long)knob->encoder_b);
+    KNOB_CHECK(ESP_OK == ret, "encoder B deinit failed", ESP_FAIL);
     knob_dev_t **curr;
     for (curr = &s_head_handle; *curr;)
     {
@@ -193,11 +250,14 @@ esp_err_t iot_knob_delete(knob_handle_t knob_handle)
     }
     ESP_LOGD(TAG, "remain knob number=%d", number);
 
-    if (0 == number && s_is_timer_running)
+    if (0 == number)
     {
-        esp_timer_stop(s_knob_timer_handle);
-        esp_timer_delete(s_knob_timer_handle);
         s_is_timer_running = false;
+        if (s_knob_task_handle)
+        {
+            vTaskDelete(s_knob_task_handle);
+            s_knob_task_handle = NULL;
+        }
     }
 
     return ESP_OK;
@@ -247,23 +307,30 @@ esp_err_t iot_knob_clear_count_value(knob_handle_t knob_handle)
 
 esp_err_t iot_knob_resume(void)
 {
-    KNOB_CHECK(s_knob_timer_handle, "knob timer handle is invalid", ESP_ERR_INVALID_STATE);
-    KNOB_CHECK(!s_is_timer_running, "knob timer is already running", ESP_ERR_INVALID_STATE);
+    KNOB_CHECK(s_knob_task_handle, "knob task handle is invalid", ESP_ERR_INVALID_STATE);
+    KNOB_CHECK(!s_is_timer_running, "knob monitor is already running", ESP_ERR_INVALID_STATE);
 
-    esp_err_t err = esp_timer_start_periodic(s_knob_timer_handle, TICKS_INTERVAL * 1000U);
-    KNOB_CHECK(ESP_OK == err, "knob timer start failed", ESP_FAIL);
+    for (knob_dev_t *target = s_head_handle; target; target = target->next)
+    {
+        gpio_intr_enable((int)(long)target->encoder_a);
+        gpio_intr_enable((int)(long)target->encoder_b);
+    }
     s_is_timer_running = true;
     return ESP_OK;
 }
 
 esp_err_t iot_knob_stop(void)
 {
-    KNOB_CHECK(s_knob_timer_handle, "knob timer handle is invalid", ESP_ERR_INVALID_STATE);
-    KNOB_CHECK(s_is_timer_running, "knob timer is not running", ESP_ERR_INVALID_STATE);
+    KNOB_CHECK(s_knob_task_handle, "knob task handle is invalid", ESP_ERR_INVALID_STATE);
+    KNOB_CHECK(s_is_timer_running, "knob monitor is not running", ESP_ERR_INVALID_STATE);
 
-    esp_err_t err = esp_timer_stop(s_knob_timer_handle);
-    KNOB_CHECK(ESP_OK == err, "knob timer stop failed", ESP_FAIL);
     s_is_timer_running = false;
+    for (knob_dev_t *target = s_head_handle; target; target = target->next)
+    {
+        gpio_intr_disable((int)(long)target->encoder_a);
+        gpio_intr_disable((int)(long)target->encoder_b);
+    }
+    xTaskNotifyGive(s_knob_task_handle);
     return ESP_OK;
 }
 
@@ -272,12 +339,10 @@ esp_err_t knob_gpio_init(uint32_t gpio_num)
     gpio_config_t gpio_cfg = {
         .pin_bit_mask = (1ULL << gpio_num),
         .mode = GPIO_MODE_INPUT,
-        .intr_type = GPIO_INTR_DISABLE,
+        .intr_type = GPIO_INTR_ANYEDGE,
         .pull_up_en = 1,
     };
-    esp_err_t ret = gpio_config(&gpio_cfg);
-
-    return ret;
+    return gpio_config(&gpio_cfg);
 }
 
 esp_err_t knob_gpio_deinit(uint32_t gpio_num)

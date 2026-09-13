@@ -27,7 +27,8 @@
 #define SWEEP_BEAM_RAYS 10
 #define SWEEP_BEAM_WIDTH_DEG 10.0
 #define SWEEP_ROTATION_PERIOD_US 15000000.0
-#define RADAR_FRAME_PERIOD_MS 50
+#define RADAR_ANIMATION_PERIOD_MS 100
+#define RADAR_IDLE_WAIT_MS 1000
 #define KILOMETRES_PER_DEGREE 111.32
 #define RADAR_AIRPORT_LABEL_WIDTH 30
 #define PAGE_TRANSITION_MS 320
@@ -69,12 +70,16 @@ typedef struct
 
 static const char *DISPLAY_TAG = "radar_display";
 static SemaphoreHandle_t state_mutex;
+static SemaphoreHandle_t selection_changed;
+static TaskHandle_t render_task_handle;
 static display_state_t state;
 static radar_aircraft_list_t pending_aircraft;
+static uint32_t clock_revision;
 static double previous_sweep_angle;
 static bool sweep_angle_initialized;
 static lv_obj_t *canvas;
 static lv_color_t *canvas_buffer;
+static lv_color_t *radar_background_buffer;
 static lv_obj_t *clock_canvas;
 static lv_color_t *clock_canvas_buffer;
 static bool clock_page_active;
@@ -85,6 +90,23 @@ static int page_drag_start_radar_x;
 static lv_img_dsc_t aircraft_icon_images[AIRCRAFT_ICON_DIRECTIONS];
 static void *aircraft_icon_buffers[AIRCRAFT_ICON_DIRECTIONS];
 static bool aircraft_icons_ready;
+
+static void notify_render_task(void)
+{
+    if (render_task_handle)
+        xTaskNotifyGive(render_task_handle);
+}
+
+static void clock_changed(void)
+{
+    ++clock_revision;
+}
+
+static void signal_selection_change(void)
+{
+    if (selection_changed)
+        xSemaphoreGive(selection_changed);
+}
 
 static void clear_details_locked(void)
 {
@@ -239,10 +261,14 @@ static bool pending_contains_aircraft(const char *icao24)
     return false;
 }
 
-static void ensure_selected_aircraft_locked(void)
+static bool ensure_selected_aircraft_locked(void)
 {
     if (!state.detail_active)
-        return;
+        return false;
+
+    const bool was_active = state.detail_active;
+    char previous_icao24[sizeof(state.selected_icao24)];
+    strlcpy(previous_icao24, state.selected_icao24, sizeof(previous_icao24));
 
     bool selected_is_visible = false;
     int first_visible = -1;
@@ -272,15 +298,18 @@ static void ensure_selected_aircraft_locked(void)
         state.selected_icao24[0] = '\0';
         clear_details_locked();
     }
+
+    return was_active != state.detail_active ||
+           strcmp(previous_icao24, state.selected_icao24) != 0;
 }
 
-static void update_aircraft_at_sweep_locked(double sweep_angle)
+static bool update_aircraft_at_sweep_locked(double sweep_angle)
 {
     if (!sweep_angle_initialized)
     {
         previous_sweep_angle = sweep_angle;
         sweep_angle_initialized = true;
-        return;
+        return false;
     }
 
     for (size_t i = 0; i < pending_aircraft.count; ++i)
@@ -330,7 +359,7 @@ static void update_aircraft_at_sweep_locked(double sweep_angle)
     }
 
     previous_sweep_angle = sweep_angle;
-    ensure_selected_aircraft_locked();
+    return ensure_selected_aircraft_locked();
 }
 
 static int find_nearest_aircraft(const display_state_t *snapshot, int tap_x, int tap_y)
@@ -379,8 +408,9 @@ static void show_clock_page(bool show)
     clock_page_active = show;
     state.city_rotation_events = 0;
     xSemaphoreGive(state_mutex);
-    animate_page_to(canvas, show ? -RADAR_SIZE : 0);
-    animate_page_to(clock_canvas, show ? 0 : RADAR_SIZE);
+    notify_render_task();
+    animate_page_to(canvas, show ? RADAR_SIZE : 0);
+    animate_page_to(clock_canvas, show ? 0 : -RADAR_SIZE);
 }
 
 static void page_touch(lv_event_t *event)
@@ -411,12 +441,12 @@ static void page_touch(lv_event_t *event)
     if (code == LV_EVENT_PRESSING)
     {
         int radar_x = page_drag_start_radar_x + delta_x;
-        if (radar_x > 0)
+        if (radar_x < 0)
             radar_x = 0;
-        else if (radar_x < -RADAR_SIZE)
-            radar_x = -RADAR_SIZE;
+        else if (radar_x > RADAR_SIZE)
+            radar_x = RADAR_SIZE;
         lv_obj_set_x(canvas, radar_x);
-        lv_obj_set_x(clock_canvas, radar_x + RADAR_SIZE);
+        lv_obj_set_x(clock_canvas, radar_x - RADAR_SIZE);
         return;
     }
 
@@ -434,8 +464,8 @@ static void page_touch(lv_event_t *event)
     suppress_canvas_click = abs(delta_x) >= PAGE_DRAG_SLOP_PX &&
                             lv_event_get_target(event) == canvas;
     const bool show_clock = clock_page_active
-                                ? delta_x < PAGE_SWIPE_THRESHOLD_PX
-                                : delta_x <= -PAGE_SWIPE_THRESHOLD_PX;
+                                ? delta_x > -PAGE_SWIPE_THRESHOLD_PX
+                                : delta_x >= PAGE_SWIPE_THRESHOLD_PX;
     show_clock_page(show_clock);
 }
 
@@ -484,6 +514,8 @@ static void canvas_clicked(lv_event_t *event)
         }
     }
     xSemaphoreGive(state_mutex);
+    signal_selection_change();
+    notify_render_task();
 }
 
 static void draw_canvas_line(lv_obj_t *target, int x1, int y1, int x2, int y2,
@@ -1121,23 +1153,57 @@ static void render_frame(const display_state_t *snapshot, double sweep_angle)
 {
     const lv_color_t green = lv_color_hex(0x00d040);
     const lv_color_t dim_green = lv_color_hex(0x006822);
-    lv_canvas_fill_bg(canvas, lv_color_black(), LV_OPA_COVER);
+    static bool background_valid;
+    static double background_latitude;
+    static double background_longitude;
+    static double background_radius_deg;
+    static bool background_airports;
+    static bool background_coastlines;
+    const bool rebuild_background = !radar_background_buffer || !background_valid ||
+                                    background_latitude != snapshot->latitude ||
+                                    background_longitude != snapshot->longitude ||
+                                    background_radius_deg != snapshot->radius_deg ||
+                                    background_airports != snapshot->show_airports ||
+                                    background_coastlines != snapshot->show_coastlines;
 
-    lv_draw_arc_dsc_t arc;
-    lv_draw_arc_dsc_init(&arc);
-    arc.color = dim_green;
-    arc.width = 1;
-    arc.opa = LV_OPA_COVER;
-    lv_canvas_draw_arc(canvas, RADAR_CENTER, RADAR_CENTER, 55, 0, 360, &arc);
-    lv_canvas_draw_arc(canvas, RADAR_CENTER, RADAR_CENTER, 110, 0, 360, &arc);
-    lv_canvas_draw_arc(canvas, RADAR_CENTER, RADAR_CENTER, RADAR_RADIUS_PX, 0, 360, &arc);
-    draw_line(14, RADAR_CENTER, 346, RADAR_CENTER, dim_green, 1, LV_OPA_60);
-    draw_line(RADAR_CENTER, 14, RADAR_CENTER, 346, dim_green, 1, LV_OPA_60);
+    if (rebuild_background)
+    {
+        lv_canvas_fill_bg(canvas, lv_color_black(), LV_OPA_COVER);
 
-    if (snapshot->show_coastlines)
-        draw_coastlines(snapshot);
-    if (snapshot->show_airports)
-        draw_airports(snapshot);
+        lv_draw_arc_dsc_t arc;
+        lv_draw_arc_dsc_init(&arc);
+        arc.color = dim_green;
+        arc.width = 1;
+        arc.opa = LV_OPA_COVER;
+        lv_canvas_draw_arc(canvas, RADAR_CENTER, RADAR_CENTER, 55, 0, 360, &arc);
+        lv_canvas_draw_arc(canvas, RADAR_CENTER, RADAR_CENTER, 110, 0, 360, &arc);
+        lv_canvas_draw_arc(canvas, RADAR_CENTER, RADAR_CENTER, RADAR_RADIUS_PX, 0, 360, &arc);
+        draw_line(14, RADAR_CENTER, 346, RADAR_CENTER, dim_green, 1, LV_OPA_60);
+        draw_line(RADAR_CENTER, 14, RADAR_CENTER, 346, dim_green, 1, LV_OPA_60);
+
+        if (snapshot->show_coastlines)
+            draw_coastlines(snapshot);
+        if (snapshot->show_airports)
+            draw_airports(snapshot);
+
+        if (radar_background_buffer)
+        {
+            memcpy(radar_background_buffer, canvas_buffer,
+                   LV_CANVAS_BUF_SIZE_TRUE_COLOR(RADAR_SIZE, RADAR_SIZE));
+            background_latitude = snapshot->latitude;
+            background_longitude = snapshot->longitude;
+            background_radius_deg = snapshot->radius_deg;
+            background_airports = snapshot->show_airports;
+            background_coastlines = snapshot->show_coastlines;
+            background_valid = true;
+        }
+    }
+    else
+    {
+        memcpy(canvas_buffer, radar_background_buffer,
+               LV_CANVAS_BUF_SIZE_TRUE_COLOR(RADAR_SIZE, RADAR_SIZE));
+        lv_obj_invalidate(canvas);
+    }
 
     for (size_t i = 0; i < snapshot->aircraft.count; ++i)
     {
@@ -1588,6 +1654,8 @@ static void render_task(void *arg)
     assert(snapshot);
     time_t last_clock_second = (time_t)-1;
     radar_city_t last_clock_city = RADAR_CITY_COUNT;
+    uint32_t last_clock_revision = UINT32_MAX;
+    bool radar_rendered = false;
 
     while (true)
     {
@@ -1595,15 +1663,25 @@ static void render_task(void *arg)
             (double)esp_timer_get_time() * 2.0 * M_PI / SWEEP_ROTATION_PERIOD_US,
             2.0 * M_PI);
         xSemaphoreTake(state_mutex, portMAX_DELAY);
+        bool selection_updated = false;
         if (state.show_sweep)
-            update_aircraft_at_sweep_locked(sweep_angle);
+            selection_updated = update_aircraft_at_sweep_locked(sweep_angle);
         *snapshot = state;
+        const bool clock_active = clock_page_active;
+        const uint32_t current_clock_revision = clock_revision;
         xSemaphoreGive(state_mutex);
+        if (selection_updated)
+            signal_selection_change();
         if (waveshare_display_lock(1000))
         {
-            render_frame(snapshot, sweep_angle);
+            if (!clock_active || !radar_rendered)
+            {
+                render_frame(snapshot, sweep_angle);
+                radar_rendered = true;
+            }
             const time_t now = time(NULL);
-            if (now != last_clock_second ||
+            if ((clock_active && now != last_clock_second) ||
+                current_clock_revision != last_clock_revision ||
                 snapshot->active_city != last_clock_city)
             {
                 struct tm local_time;
@@ -1611,10 +1689,17 @@ static void render_task(void *arg)
                 render_clock(snapshot, &local_time);
                 last_clock_second = now;
                 last_clock_city = snapshot->active_city;
+                last_clock_revision = current_clock_revision;
             }
             waveshare_display_unlock();
         }
-        vTaskDelay(pdMS_TO_TICKS(RADAR_FRAME_PERIOD_MS));
+
+        const TickType_t wait_ticks = clock_active
+                                          ? pdMS_TO_TICKS(RADAR_IDLE_WAIT_MS)
+                                      : snapshot->show_sweep
+                                          ? pdMS_TO_TICKS(RADAR_ANIMATION_PERIOD_MS)
+                                          : portMAX_DELAY;
+        ulTaskNotifyTake(pdTRUE, wait_ticks);
     }
 }
 
@@ -1622,6 +1707,8 @@ void radar_display_init(void)
 {
     state_mutex = xSemaphoreCreateMutex();
     assert(state_mutex);
+    selection_changed = xSemaphoreCreateBinary();
+    assert(selection_changed);
     state.latitude = 0.0;
     state.longitude = 0.0;
     state.radius_deg = 0.75;
@@ -1640,9 +1727,10 @@ void radar_display_init(void)
     memset(&pending_aircraft, 0, sizeof(pending_aircraft));
     previous_sweep_angle = 0.0;
     sweep_angle_initialized = false;
-    clock_page_active = false;
+    clock_page_active = true;
     clear_details_locked();
     strlcpy(state.status, "Flight Radar starting", sizeof(state.status));
+    clock_revision = 1;
 
     waveshare_display_port_init();
     canvas_buffer = heap_caps_malloc(LV_CANVAS_BUF_SIZE_TRUE_COLOR(RADAR_SIZE, RADAR_SIZE),
@@ -1653,6 +1741,11 @@ void radar_display_init(void)
                                          MALLOC_CAP_8BIT);
     }
     assert(canvas_buffer);
+    radar_background_buffer = heap_caps_malloc(
+        LV_CANVAS_BUF_SIZE_TRUE_COLOR(RADAR_SIZE, RADAR_SIZE),
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!radar_background_buffer)
+        ESP_LOGW(DISPLAY_TAG, "Static radar background cache unavailable");
     clock_canvas_buffer = heap_caps_malloc(
         LV_CANVAS_BUF_SIZE_TRUE_COLOR(RADAR_SIZE, RADAR_SIZE),
         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -1671,7 +1764,7 @@ void radar_display_init(void)
         lv_obj_set_scrollbar_mode(lv_scr_act(), LV_SCROLLBAR_MODE_OFF);
         canvas = lv_canvas_create(lv_scr_act());
         lv_canvas_set_buffer(canvas, canvas_buffer, RADAR_SIZE, RADAR_SIZE, LV_IMG_CF_TRUE_COLOR);
-        lv_obj_center(canvas);
+        lv_obj_set_pos(canvas, RADAR_SIZE, 0);
         init_rotated_aircraft_icons();
         lv_obj_add_flag(canvas, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_clear_flag(canvas, LV_OBJ_FLAG_SCROLLABLE);
@@ -1682,7 +1775,7 @@ void radar_display_init(void)
         clock_canvas = lv_canvas_create(lv_scr_act());
         lv_canvas_set_buffer(clock_canvas, clock_canvas_buffer, RADAR_SIZE,
                              RADAR_SIZE, LV_IMG_CF_TRUE_COLOR);
-        lv_obj_set_pos(clock_canvas, RADAR_SIZE, 0);
+        lv_obj_set_pos(clock_canvas, 0, 0);
         lv_obj_add_flag(clock_canvas, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_clear_flag(clock_canvas, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_scrollbar_mode(clock_canvas, LV_SCROLLBAR_MODE_OFF);
@@ -1690,7 +1783,9 @@ void radar_display_init(void)
         waveshare_display_unlock();
     }
     ESP_LOGI(DISPLAY_TAG, "360x360 radar display ready");
-    xTaskCreate(render_task, "radar_render", 6144, NULL, 3, NULL);
+    BaseType_t created = xTaskCreate(render_task, "radar_render", 6144, NULL, 3,
+                                     &render_task_handle);
+    assert(created == pdPASS);
 }
 
 void radar_display_update_aircraft(const radar_aircraft_list_t *aircraft)
@@ -1703,38 +1798,73 @@ void radar_display_update_aircraft(const radar_aircraft_list_t *aircraft)
         ensure_selected_aircraft_locked();
     }
     xSemaphoreGive(state_mutex);
+    signal_selection_change();
+    notify_render_task();
 }
 
 void radar_display_set_status(const char *status)
 {
+    bool changed = false;
     xSemaphoreTake(state_mutex, portMAX_DELAY);
-    strlcpy(state.status, status, sizeof(state.status));
+    if (strcmp(state.status, status) != 0)
+    {
+        strlcpy(state.status, status, sizeof(state.status));
+        changed = true;
+    }
     xSemaphoreGive(state_mutex);
+    if (changed)
+        notify_render_task();
 }
 
 void radar_display_set_wifi_connected(bool connected)
 {
+    bool changed = false;
     xSemaphoreTake(state_mutex, portMAX_DELAY);
-    state.wifi_connected = connected;
+    if (state.wifi_connected != connected)
+    {
+        state.wifi_connected = connected;
+        changed = true;
+    }
     xSemaphoreGive(state_mutex);
+    if (changed)
+    {
+        signal_selection_change();
+        notify_render_task();
+    }
 }
 
 void radar_display_set_weather(radar_city_t city,
                                const radar_weather_t *weather)
 {
     if (!weather || city < 0 || city >= RADAR_CITY_COUNT) return;
+    bool changed = false;
     xSemaphoreTake(state_mutex, portMAX_DELAY);
-    state.weather[city] = *weather;
+    if (memcmp(&state.weather[city], weather, sizeof(*weather)) != 0)
+    {
+        state.weather[city] = *weather;
+        clock_changed();
+        changed = true;
+    }
     xSemaphoreGive(state_mutex);
+    if (changed)
+        notify_render_task();
 }
 
 void radar_display_set_battery(int percentage)
 {
+    bool changed = false;
     xSemaphoreTake(state_mutex, portMAX_DELAY);
-    state.battery_percentage = percentage < 0 ? 0 :
-                               percentage > 100 ? 100 : percentage;
-    state.battery_valid = true;
+    const int clamped = percentage < 0 ? 0 : percentage > 100 ? 100 : percentage;
+    if (!state.battery_valid || state.battery_percentage != clamped)
+    {
+        state.battery_percentage = clamped;
+        state.battery_valid = true;
+        clock_changed();
+        changed = true;
+    }
     xSemaphoreGive(state_mutex);
+    if (changed)
+        notify_render_task();
 }
 
 void radar_display_set_center(double latitude, double longitude, double radius_deg)
@@ -1744,6 +1874,7 @@ void radar_display_set_center(double latitude, double longitude, double radius_d
     state.longitude = longitude;
     state.radius_deg = fmin(2.5, fmax(0.05, radius_deg));
     xSemaphoreGive(state_mutex);
+    notify_render_task();
 }
 
 void radar_display_set_options(bool show_sweep, bool show_labels,
@@ -1764,13 +1895,17 @@ void radar_display_set_options(bool show_sweep, bool show_labels,
     state.show_airports = show_airports;
     state.show_coastlines = show_coastlines;
     xSemaphoreGive(state_mutex);
+    signal_selection_change();
+    notify_render_task();
 }
 
 bool radar_display_rotate_selection(int direction)
 {
     xSemaphoreTake(state_mutex, portMAX_DELAY);
+    bool selection_updated = false;
     if (clock_page_active)
     {
+        bool city_changed = false;
         if (direction > 0)
             ++state.city_rotation_events;
         else if (direction < 0)
@@ -1783,8 +1918,12 @@ bool radar_display_rotate_selection(int direction)
                                     ? RADAR_CITY_TEHRAN
                                     : RADAR_CITY_MELBOURNE;
             state.city_rotation_events = 0;
+            clock_changed();
+            city_changed = true;
         }
         xSemaphoreGive(state_mutex);
+        if (city_changed)
+            notify_render_task();
         return true;
     }
 
@@ -1834,10 +1973,15 @@ bool radar_display_rotate_selection(int direction)
             {
                 strlcpy(state.selected_icao24, next_icao24, sizeof(state.selected_icao24));
                 clear_details_locked();
+                selection_updated = true;
             }
         }
     }
     xSemaphoreGive(state_mutex);
+    if (selection_updated)
+        signal_selection_change();
+    if (detail_active)
+        notify_render_task();
     return detail_active;
 }
 
@@ -1863,17 +2007,31 @@ bool radar_display_get_selected_aircraft(radar_aircraft_t *aircraft)
     return found;
 }
 
+bool radar_display_wait_for_selection_change(uint32_t timeout_ms)
+{
+    if (!selection_changed)
+        return false;
+    const TickType_t timeout = timeout_ms == UINT32_MAX
+                                   ? portMAX_DELAY
+                                   : pdMS_TO_TICKS(timeout_ms);
+    return xSemaphoreTake(selection_changed, timeout) == pdTRUE;
+}
+
 void radar_display_set_details_loading(const char *icao24)
 {
     if (!icao24)
         return;
+    bool changed = false;
     xSemaphoreTake(state_mutex, portMAX_DELAY);
     if (state.detail_active && strcmp(state.selected_icao24, icao24) == 0)
     {
         state.details_state = DETAILS_LOADING;
         memset(&state.details, 0, sizeof(state.details));
+        changed = true;
     }
     xSemaphoreGive(state_mutex);
+    if (changed)
+        notify_render_task();
 }
 
 void radar_display_set_aircraft_details(const char *icao24,
@@ -1882,11 +2040,15 @@ void radar_display_set_aircraft_details(const char *icao24,
 {
     if (!icao24 || !details)
         return;
+    bool changed = false;
     xSemaphoreTake(state_mutex, portMAX_DELAY);
     if (state.detail_active && strcmp(state.selected_icao24, icao24) == 0)
     {
         state.details = *details;
         state.details_state = available ? DETAILS_READY : DETAILS_UNAVAILABLE;
+        changed = true;
     }
     xSemaphoreGive(state_mutex);
+    if (changed)
+        notify_render_task();
 }

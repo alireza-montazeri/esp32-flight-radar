@@ -5,6 +5,8 @@
 #include "driver/i2c_master.h"
 #include "driver/spi_master.h"
 
+/* GPIO19 (USB D-) and GPIO20 (USB D+) are reserved for native USB. */
+
 /* Exact GPIO allocation from the supplied Waveshare schematic/demo. */
 #define LCD_HOST                         SPI2_HOST
 #define TOUCH_HOST                       I2C_NUM_0

@@ -117,7 +117,7 @@ extern "C"
     esp_err_t iot_knob_clear_count_value(knob_handle_t knob_handle);
 
     /**
-     * @brief resume knob timer, if knob timer is stopped. Make sure iot_knob_create() is called before calling this API.
+     * @brief Resume knob monitoring after it has been stopped.
      *
      * @return
      *     - ESP_OK on success
@@ -126,7 +126,7 @@ extern "C"
     esp_err_t iot_knob_resume(void);
 
     /**
-     * @brief stop knob timer, if knob timer is running. Make sure iot_knob_create() is called before calling this API.
+     * @brief Stop knob monitoring until iot_knob_resume() is called.
      *
      * @return
      *     - ESP_OK on success
@@ -138,7 +138,7 @@ extern "C"
      * @brief Initialize a GPIO pin for knob input.
      *
      * This function configures a specified GPIO pin as an input for knob control.
-     * It sets the pin mode, disables interrupts, and enables the pull-up resistor.
+     * It sets the pin mode, enables edge interrupts, and enables the pull-up resistor.
      *
      * @param gpio_num The GPIO number to be configured.
      * @return

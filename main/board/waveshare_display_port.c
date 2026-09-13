@@ -19,8 +19,18 @@
 #include "lcd_touch_bsp.h"
 #include "user_config.h"
 #include "lcd_bl_pwm_bsp.h"
+
+#define DISPLAY_BRIGHTNESS_NORMAL LCD_PWM_MODE_200
+#define DISPLAY_BRIGHTNESS_DIM LCD_PWM_MODE_50
+#define DISPLAY_BRIGHTNESS_LOW 10
+#define DISPLAY_DIM_DELAY_MS (20 * 1000)
+#define DISPLAY_LOW_DELAY_MS (40 * 1000)
+
 static const char *TAG = "waveshare_display";
 static SemaphoreHandle_t lvgl_mux = NULL;
+static SemaphoreHandle_t brightness_mutex = NULL;
+static TickType_t display_last_activity_tick;
+static uint16_t display_brightness = DISPLAY_BRIGHTNESS_NORMAL;
 
 
 #if CONFIG_LV_COLOR_DEPTH == 32
@@ -277,11 +287,15 @@ void example_lvgl_rounder_cb(struct _lv_disp_drv_t *disp_drv, lv_area_t *area)
 #if EXAMPLE_USE_TOUCH
 static void example_lvgl_touch_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
 {
+    static bool wake_touch_active;
     uint16_t tp_x;
     uint16_t tp_y;
     uint8_t win = tpGetCoordinates(&tp_x,&tp_y);
     if (win)
     {
+        if (waveshare_display_note_activity())
+            wake_touch_active = true;
+
         #ifdef EXAMPLE_Rotate_90
             data->point.x = tp_y;
             data->point.y = (EXAMPLE_LCD_V_RES - tp_x);
@@ -293,20 +307,57 @@ static void example_lvgl_touch_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
         data->point.x = EXAMPLE_LCD_H_RES;
         if(data->point.y > EXAMPLE_LCD_V_RES)
         data->point.y = EXAMPLE_LCD_V_RES;
-        data->state = LV_INDEV_STATE_PRESSED;
+        data->state = wake_touch_active ? LV_INDEV_STATE_RELEASED
+                                        : LV_INDEV_STATE_PRESSED;
         //ESP_LOGE("TP","(%d,%d)",data->point.x,data->point.y);
     }
     else
     {
         data->state = LV_INDEV_STATE_RELEASED;
+        wake_touch_active = false;
     }
 }
 #endif
 
-static void example_increase_lvgl_tick(void *arg)
+bool waveshare_display_note_activity(void)
 {
-    /* Tell LVGL how many milliseconds has elapsed */
-    lv_tick_inc(EXAMPLE_LVGL_TICK_PERIOD_MS);
+    assert(brightness_mutex);
+    xSemaphoreTake(brightness_mutex, portMAX_DELAY);
+
+    display_last_activity_tick = xTaskGetTickCount();
+    const bool was_dimmed = display_brightness != DISPLAY_BRIGHTNESS_NORMAL;
+    if (was_dimmed)
+    {
+        display_brightness = DISPLAY_BRIGHTNESS_NORMAL;
+        setUpduty(DISPLAY_BRIGHTNESS_NORMAL);
+    }
+
+    xSemaphoreGive(brightness_mutex);
+    return was_dimmed;
+}
+
+static void update_idle_brightness(TickType_t now)
+{
+    uint16_t desired_brightness;
+    bool changed = false;
+
+    xSemaphoreTake(brightness_mutex, portMAX_DELAY);
+    const TickType_t idle_ticks = now - display_last_activity_tick;
+    if (idle_ticks >= pdMS_TO_TICKS(DISPLAY_LOW_DELAY_MS))
+        desired_brightness = DISPLAY_BRIGHTNESS_LOW;
+    else if (idle_ticks >= pdMS_TO_TICKS(DISPLAY_DIM_DELAY_MS))
+        desired_brightness = DISPLAY_BRIGHTNESS_DIM;
+    else
+        desired_brightness = DISPLAY_BRIGHTNESS_NORMAL;
+
+    if (desired_brightness != display_brightness)
+    {
+        display_brightness = desired_brightness;
+        changed = true;
+    }
+    if (changed)
+        setUpduty(desired_brightness);
+    xSemaphoreGive(brightness_mutex);
 }
 
 bool waveshare_display_lock(int timeout_ms)
@@ -327,7 +378,15 @@ static void example_lvgl_port_task(void *arg)
 {
     ESP_LOGI(TAG, "Starting LVGL task");
     uint32_t task_delay_ms = EXAMPLE_LVGL_TASK_MAX_DELAY_MS;
+    int64_t last_tick_us = esp_timer_get_time();
     while (1) {
+        const int64_t now_us = esp_timer_get_time();
+        update_idle_brightness(xTaskGetTickCount());
+        const uint32_t elapsed_ms = (uint32_t)((now_us - last_tick_us) / 1000);
+        if (elapsed_ms > 0) {
+            lv_tick_inc(elapsed_ms);
+            last_tick_us += (int64_t)elapsed_ms * 1000;
+        }
         // Lock the mutex due to the LVGL APIs are not thread-safe
         if (waveshare_display_lock(-1)) {
             task_delay_ms = lv_timer_handler();
@@ -367,7 +426,11 @@ void waveshare_display_port_init(void)
     static lv_disp_draw_buf_t disp_buf; // contains internal graphic buffer(s) called draw buffer(s)
     static lv_disp_drv_t disp_drv;      // contains callback functions
 
-    lcd_bl_pwm_bsp_init(LCD_PWM_MODE_255);
+    brightness_mutex = xSemaphoreCreateMutex();
+    assert(brightness_mutex);
+    display_last_activity_tick = xTaskGetTickCount();
+    display_brightness = DISPLAY_BRIGHTNESS_NORMAL;
+    lcd_bl_pwm_bsp_init(DISPLAY_BRIGHTNESS_NORMAL);
 
     ESP_LOGI(TAG, "Initialize SPI bus");
     const spi_bus_config_t buscfg = 
@@ -432,16 +495,6 @@ void waveshare_display_port_init(void)
     disp_drv.draw_buf = &disp_buf;
     disp_drv.user_data = panel_handle;
     lv_disp_t *disp = lv_disp_drv_register(&disp_drv);
-
-    ESP_LOGI(TAG, "Install LVGL tick timer");
-    //Tick interface for LVGL (using esp_timer to generate 2ms periodic event)
-    const esp_timer_create_args_t lvgl_tick_timer_args = {
-        .callback = &example_increase_lvgl_tick,
-        .name = "lvgl_tick"
-    };
-    esp_timer_handle_t lvgl_tick_timer = NULL;
-    ESP_ERROR_CHECK(esp_timer_create(&lvgl_tick_timer_args, &lvgl_tick_timer));
-    ESP_ERROR_CHECK(esp_timer_start_periodic(lvgl_tick_timer, EXAMPLE_LVGL_TICK_PERIOD_MS * 1000));
 
 #if EXAMPLE_USE_TOUCH
     static lv_indev_drv_t indev_drv;           // Input device driver (Touch)

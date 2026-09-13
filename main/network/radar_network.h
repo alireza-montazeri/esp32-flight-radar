@@ -1,12 +1,14 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 #include "esp_err.h"
 #include "radar_config.h"
 #include "radar_types.h"
 
 esp_err_t radar_network_start(const radar_config_t *config);
 bool radar_network_is_connected(void);
+bool radar_network_wait_until_connected(uint32_t timeout_ms);
 bool radar_network_setup_ap_active(void);
 bool radar_network_is_authenticated(void);
 esp_err_t radar_network_fetch_city_weather(radar_city_t city,

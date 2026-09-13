@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 #include "radar_types.h"
 
 void radar_display_init(void);
@@ -19,6 +20,9 @@ bool radar_display_rotate_selection(int direction);
 
 /** Copies the selected live aircraft for asynchronous metadata lookup. */
 bool radar_display_get_selected_aircraft(radar_aircraft_t *aircraft);
+
+/** Blocks until the selected aircraft or network state may have changed. */
+bool radar_display_wait_for_selection_change(uint32_t timeout_ms);
 void radar_display_set_details_loading(const char *icao24);
 void radar_display_set_aircraft_details(const char *icao24,
                                         const radar_aircraft_details_t *details,

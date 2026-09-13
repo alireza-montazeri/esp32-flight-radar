@@ -1404,7 +1404,6 @@ CONFIG_SPI_SLAVE_ISR_IN_IRAM=y
 #
 # ESP-Driver:USB Serial/JTAG Configuration
 #
-# default:
 CONFIG_USJ_ENABLE_USB_SERIAL_JTAG=y
 # end of ESP-Driver:USB Serial/JTAG Configuration
 
@@ -1810,11 +1809,8 @@ CONFIG_ESP_PHY_ENABLE_VERSION_PRINT=y
 #
 # Power Management
 #
-# default:
 # CONFIG_PM_SLEEP_FUNC_IN_IRAM is not set
-# default:
 # CONFIG_PM_ENABLE is not set
-# default:
 # CONFIG_PM_SLP_IRAM_OPT is not set
 # default:
 CONFIG_PM_POWER_DOWN_CPU_IN_LIGHT_SLEEP=y
@@ -3781,8 +3777,8 @@ CONFIG_LV_MEMCPY_MEMSET_STD=y
 #
 # HAL Settings
 #
-CONFIG_LV_DISP_DEF_REFR_PERIOD=20
-CONFIG_LV_INDEV_DEF_READ_PERIOD=20
+CONFIG_LV_DISP_DEF_REFR_PERIOD=50
+CONFIG_LV_INDEV_DEF_READ_PERIOD=50
 # default:
 # CONFIG_LV_TICK_CUSTOM is not set
 # default:

@@ -11,7 +11,7 @@
 #include "freertos/task.h"
 
 #define BATTERY_ADC_CHANNEL ADC_CHANNEL_0
-#define BATTERY_SAMPLE_COUNT 16
+#define BATTERY_SAMPLE_COUNT 8
 #define BATTERY_DIVIDER_RATIO 2.0f
 
 typedef struct {

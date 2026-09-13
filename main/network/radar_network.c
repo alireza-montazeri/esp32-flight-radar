@@ -48,7 +48,6 @@ static const char *TAG = "radar_network";
 static EventGroupHandle_t wifi_events;
 static SemaphoreHandle_t http_mutex;
 static int wifi_retries;
-static bool connected;
 static bool setup_ap;
 static bool mdns_started;
 static radar_config_t web_config;
@@ -312,7 +311,7 @@ esp_err_t radar_network_fetch_aircraft(const radar_config_t *config,
 {
     memset(aircraft, 0, sizeof(*aircraft));
     *http_status = 0;
-    if (!connected) return ESP_ERR_INVALID_STATE;
+    if (!radar_network_is_connected()) return ESP_ERR_INVALID_STATE;
 
     if (refresh_bearer(config) != ESP_OK) {
         ESP_LOGW(TAG, "Continuing with anonymous OpenSky access");
@@ -387,7 +386,7 @@ esp_err_t radar_network_fetch_aircraft_details(const radar_aircraft_t *aircraft,
     memset(details, 0, sizeof(*details));
     strlcpy(details->icao24, aircraft->icao24, sizeof(details->icao24));
     *http_status = 0;
-    if (!connected) return ESP_ERR_INVALID_STATE;
+    if (!radar_network_is_connected()) return ESP_ERR_INVALID_STATE;
 
     char url[256];
     if (aircraft->callsign[0]) {
@@ -629,7 +628,7 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START && web_config.wifi_ssid[0]) {
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        connected = false;
+        xEventGroupClearBits(wifi_events, WIFI_CONNECTED_BIT | WIFI_FAILED_BIT);
         radar_display_set_wifi_connected(false);
         if (wifi_retries++ < WIFI_MAX_RETRIES) {
             esp_wifi_connect();
@@ -638,7 +637,7 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         wifi_retries = 0;
-        connected = true;
+        xEventGroupClearBits(wifi_events, WIFI_FAILED_BIT);
         radar_display_set_wifi_connected(true);
         start_time_sync();
         xEventGroupSetBits(wifi_events, WIFI_CONNECTED_BIT);
@@ -691,6 +690,7 @@ esp_err_t radar_network_start(const radar_config_t *config)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta));
     ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
     ESP_ERROR_CHECK(start_web_server());
 
     if (!radar_config_has_wifi(config)) return start_setup_ap();
@@ -703,7 +703,19 @@ esp_err_t radar_network_start(const radar_config_t *config)
 
 bool radar_network_is_connected(void)
 {
-    return connected;
+    return wifi_events &&
+           (xEventGroupGetBits(wifi_events) & WIFI_CONNECTED_BIT) != 0;
+}
+
+bool radar_network_wait_until_connected(uint32_t timeout_ms)
+{
+    if (!wifi_events)
+        return false;
+    const TickType_t timeout = timeout_ms == UINT32_MAX
+                                   ? portMAX_DELAY
+                                   : pdMS_TO_TICKS(timeout_ms);
+    return (xEventGroupWaitBits(wifi_events, WIFI_CONNECTED_BIT, pdFALSE,
+                                pdFALSE, timeout) & WIFI_CONNECTED_BIT) != 0;
 }
 
 bool radar_network_setup_ap_active(void)

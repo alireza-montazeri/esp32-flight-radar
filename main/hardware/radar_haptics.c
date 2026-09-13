@@ -16,8 +16,10 @@
 #define DRV2605_REG_GO           0x0C
 
 #define DRV2605_MODE_INTTRIG     0x00
+#define DRV2605_MODE_STANDBY     0x40
 #define DRV2605_LIBRARY_ERM_E    0x05
 #define DRV2605_EFFECT_DETENT    0x05 /* Sharp Click, 60%. */
+#define HAPTIC_STANDBY_DELAY_MS  75
 
 static const char *TAG = "radar_haptics";
 static TaskHandle_t haptic_task_handle;
@@ -35,9 +37,16 @@ static void haptic_task(void *arg)
     (void)arg;
     while (true) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        if (write_register(DRV2605_REG_GO, 1) != ESP_OK) {
-            ESP_LOGW(TAG, "Haptic trigger failed");
-        }
+        if (write_register(DRV2605_REG_MODE, DRV2605_MODE_INTTRIG) != ESP_OK)
+            ESP_LOGW(TAG, "Haptic wake failed");
+        vTaskDelay(pdMS_TO_TICKS(1));
+        do {
+            if (write_register(DRV2605_REG_GO, 1) != ESP_OK)
+                ESP_LOGW(TAG, "Haptic trigger failed");
+        } while (ulTaskNotifyTake(pdTRUE,
+                                  pdMS_TO_TICKS(HAPTIC_STANDBY_DELAY_MS)) > 0);
+        if (write_register(DRV2605_REG_MODE, DRV2605_MODE_STANDBY) != ESP_OK)
+            ESP_LOGW(TAG, "Haptic standby failed");
     }
 }
 
@@ -55,6 +64,7 @@ esp_err_t radar_haptics_init(void)
     if (err == ESP_OK) err = write_register(DRV2605_REG_LIBRARY, DRV2605_LIBRARY_ERM_E);
     if (err == ESP_OK) err = write_register(DRV2605_REG_WAVESEQ1, DRV2605_EFFECT_DETENT);
     if (err == ESP_OK) err = write_register(DRV2605_REG_WAVESEQ2, 0);
+    if (err == ESP_OK) err = write_register(DRV2605_REG_MODE, DRV2605_MODE_STANDBY);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "DRV2605 configuration failed; knob haptics disabled");
         return err;
